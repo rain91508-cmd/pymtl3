@@ -72,7 +72,7 @@ class VerilogVerilatorImportConfigs( BasePassConfigs ):
 
     # Un-warn all warnings in the given list; [] to disable this option
     # The given list should only include strings that appear in `Warnings`
-    "vl_Wno_list" : [ 'UNOPTFLAT', 'UNSIGNED', 'WIDTH' ],
+    "vl_Wno_list" : [ 'UNOPTFLAT', 'UNSIGNED', 'WIDTH', 'WIDTHEXPAND' ],
 
     # Verilator misc options
 
@@ -382,7 +382,9 @@ $PYMTL_VERILATOR_INCLUDE_DIR is set or `pkg-config` has been configured properly
   def _get_c_src_files( s ):
     top_module = s.translated_top_module
     vl_mk_dir = s.vl_mk_dir
-    vl_class_mk = f"{vl_mk_dir}/V{top_module}_classes.mk"
+    # Verilator 5.x encodes __ in parameter names as ___05F
+    vl_top_module = top_module.replace('__', '___05F').replace('$', '__024')
+    vl_class_mk = f"{vl_mk_dir}/V{vl_top_module}_classes.mk"
 
     # Add C wrapper
     o0 = []

@@ -47,7 +47,9 @@ class DetectVarNames( ast.NodeVisitor ):
 
       low = up = None
 
-      if isinstance( lower, ast.Num ):
+      if lower is None:
+        low = 0
+      elif isinstance( lower, ast.Num ):
         low = node.slice.lower.n
       elif isinstance( lower, ast.Name ):
         x = lower.id
@@ -63,8 +65,6 @@ class DetectVarNames( ast.NodeVisitor ):
 
       if low is not None and up is not None:
         slices.append( slice(low, up) )
-      # FIXME
-      # else:
 
       nodelist.append( node )
       node = node.value
@@ -104,6 +104,10 @@ class DetectVarNames( ast.NodeVisitor ):
                          f"update block {self.upblk.__name__} in class {self.obj.__class__}." )
       elif isinstance( node, ast.Call ): # a.b().c()
         # FIXME?
+        return None, None
+      elif isinstance( node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.IfExp, ast.Compare) ):
+        # Expression node (e.g., (a + b)[:width]) -- visit children and return None
+        self.generic_visit( node )
         return None, None
       else:
         assert isinstance( node, ast.Str ) # filter out line_trace
@@ -146,7 +150,9 @@ class DetectVarNames( ast.NodeVisitor ):
 
       low = up = None
 
-      if isinstance( lower, ast.Num ):
+      if lower is None:
+        low = 0
+      elif isinstance( lower, ast.Num ):
         low = node.slice.lower.n
       elif isinstance( lower, ast.Name ):
         x = lower.id
@@ -162,8 +168,6 @@ class DetectVarNames( ast.NodeVisitor ):
 
       if low is not None and up is not None:
         slices.append( slice(low, up) )
-      # FIXME
-      # else:
 
       nodelist.append( node )
       node = node.value
@@ -202,6 +206,10 @@ class DetectVarNames( ast.NodeVisitor ):
         obj_name.append( (node.id, num[::-1]) )
       elif isinstance( node, ast.Call ): # a.b().c()
         # FIXME?
+        return None, None
+      elif isinstance( node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.IfExp, ast.Compare) ):
+        # Expression node (e.g., (a + b)[:width]) -- visit children and return None
+        self.generic_visit( node )
         return None, None
       else:
         assert isinstance( node, ast.Str ) # filter out line_trace

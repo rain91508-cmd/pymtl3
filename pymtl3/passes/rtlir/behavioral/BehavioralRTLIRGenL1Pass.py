@@ -8,7 +8,7 @@ import ast
 import copy
 import sys
 
-from pymtl3 import MetadataKey, dsl
+from pymtl3 import MetadataKey, dsl, mk_bits
 from pymtl3.datatypes import (
     Bits,
     concat,
@@ -123,11 +123,11 @@ class BehavioralRTLIRGeneratorL1( ast.NodeVisitor ):
     if hasattr(node, "kwargs") and node.kwargs:
       raise PyMTLSyntaxError( s.blk, node,
         'double-star argument is not supported!')
-    if node.keywords:
-      raise PyMTLSyntaxError( s.blk, node, 'keyword argument is not supported!')
 
     obj = s.const_extractor.enter( node.func )
     if obj is not None:
+      if node.keywords and not is_bitstruct_class(obj):
+        raise PyMTLSyntaxError( s.blk, node, 'keyword argument is not supported!')
       return obj
     else:
       raise PyMTLSyntaxError( s.blk, node, f'{node.func} function is not found!' )
@@ -398,7 +398,9 @@ class BehavioralRTLIRGeneratorL1( ast.NodeVisitor ):
     return ret
 
   def visit_Slice( s, node ):
-    return ( s.visit( node.lower ), s.visit( node.upper ) )
+    lower = s.visit( node.lower ) if node.lower is not None else None
+    upper = s.visit( node.upper ) if node.upper is not None else None
+    return ( lower, upper )
 
   def visit_Index( s, node ):
     return s.visit( node.value )
@@ -413,6 +415,9 @@ class BehavioralRTLIRGeneratorL1( ast.NodeVisitor ):
           raise PyMTLSyntaxError( s.blk, node,
             f'Component {obj} is not a sub-component of {s.component}!' )
         ret = bir.Base( obj )
+      elif isinstance( obj, int ):
+        # Integer closure variables are PyMTL3 parameters (compile-time constants)
+        ret = bir.Number( obj )
       else:
         # A closure variable could be a loop index. We need to
         # generate per-function closure variable instead of assuming
@@ -554,7 +559,7 @@ class ConstantExtractor( ast.NodeVisitor ):
     s.globals = global_ns
     s.cache = {}
     s.closure = closure_ns
-    s.pymtl_functions = { concat, sext, zext, trunc,
+    s.pymtl_functions = { concat, sext, zext, trunc, mk_bits,
                           reduce_or, reduce_and, reduce_xor,
                           copy.copy, copy.deepcopy }
 
@@ -643,6 +648,18 @@ class ConstantExtractor( ast.NodeVisitor ):
     else:
       obj = None
     return obj
+
+  def visit_Call( s, node ):
+    """Handle function calls like mk_bits(N) in constant extraction."""
+    func = s.visit( node.func )
+    if func is not None:
+      args = [s.visit(arg) for arg in node.args]
+      if all(a is not None for a in args):
+        try:
+          return func(*args)
+        except:
+          pass
+    return None
 
   def visit_Num( s, node ):
     return node.n

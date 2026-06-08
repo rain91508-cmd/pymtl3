@@ -421,8 +421,8 @@ class BehavioralRTLIRTypeCheckVisitorL1( bir.BehavioralRTLIRNodeVisitor ):
         f'cannot perform index on {node.value.Type}!')
 
   def visit_Slice( s, node ):
-    lower_val = None if not hasattr(node.lower, "_value") else node.lower._value
-    upper_val = None if not hasattr(node.upper, "_value") else node.upper._value
+    lower_val = None if node.lower is None or not hasattr(node.lower, "_value") else node.lower._value
+    upper_val = None if node.upper is None or not hasattr(node.upper, "_value") else node.upper._value
     dtype = node.value.Type.get_dtype()
 
     if hasattr(node.value, "_value"):
@@ -432,8 +432,10 @@ class BehavioralRTLIRTypeCheckVisitorL1( bir.BehavioralRTLIRNodeVisitor ):
     if not isinstance( dtype, rdt.Vector ):
       raise PyMTLTypeError( s.blk, node.ast, f'cannot perform slicing on type {dtype}!')
 
-    s._handle_index_extension( node, node.value, node.lower, 'slice lower bound' )
-    s._handle_index_extension( node, node.value, node.upper, 'slice upper bound', False )
+    if node.lower is not None:
+      s._handle_index_extension( node, node.value, node.lower, 'slice lower bound' )
+    if node.upper is not None:
+      s._handle_index_extension( node, node.value, node.upper, 'slice upper bound', False )
 
     if not lower_val is None and not upper_val is None:
       signal_nbits = dtype.get_length()
@@ -461,8 +463,43 @@ class BehavioralRTLIRTypeCheckVisitorL1( bir.BehavioralRTLIRNodeVisitor ):
         # Add new fields that might help translation
         node.size = slice_size
         node.base = node.lower
-      except Exception:
-        raise PyMTLTypeError( s.blk, node.ast, 'slice bounds must be constant!' )
+      except AssertionError:
+        # Try to handle x[:N] (lower N bits) or x[N:] (upper bits)
+        if node.lower is None and isinstance(node.upper, bir.Number):
+          # x[:N] — take lower N bits
+          slice_size = node.upper._value
+          signal_nbits = dtype.get_length()
+          if not (0 < slice_size <= signal_nbits):
+            raise PyMTLTypeError( s.blk, node.ast,
+              'slice bound out of width of signal!' )
+          node.Type = rt.NetWire( rdt.Vector( slice_size ) )
+          node._is_explicit = True
+          node.size = slice_size
+          node.base = None
+        elif node.upper is None and isinstance(node.lower, bir.Number):
+          # x[N:] — take upper bits starting from N
+          lower_val = node.lower._value
+          signal_nbits = dtype.get_length()
+          if not (0 <= lower_val < signal_nbits):
+            raise PyMTLTypeError( s.blk, node.ast,
+              'slice bound out of width of signal!' )
+          slice_size = signal_nbits - lower_val
+          node.Type = rt.NetWire( rdt.Vector( slice_size ) )
+          node._is_explicit = True
+          node.size = slice_size
+          node.base = node.lower
+        elif isinstance(node.lower, bir.Number) and isinstance(node.upper, bir.Number):
+          # x[N:M] — both constants but not handled above
+          signal_nbits = dtype.get_length()
+          lower_val = node.lower._value
+          upper_val = node.upper._value
+          if not (0 <= lower_val < upper_val <= signal_nbits):
+            raise PyMTLTypeError( s.blk, node.ast,
+              'upper/lower bound of slice out of width of signal!' )
+          node.Type = rt.NetWire( rdt.Vector( int( upper_val - lower_val ) ) )
+          node._is_explicit = True
+        else:
+          raise PyMTLTypeError( s.blk, node.ast, 'slice bounds must be constant!' )
 
   def _get_nbits_from_value( s, value ):
     if -1 <= value <= 1:

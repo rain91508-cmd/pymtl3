@@ -30,19 +30,28 @@ class BehavioralRTLIRGeneratorL3( BehavioralRTLIRGeneratorL2 ):
     obj = s.get_call_obj( node )
     if is_bitstruct_class( obj ):
       fields = obj.__bitstruct_fields__
-      nargs = len(node.args)
-      nfields = len(fields.keys())
-      if nargs == 0:
-        # Infer the values of each field by inspecting the object constructed
-        # with default arguments
-        inst = obj()
-        values = [s._datatype_to_bir(getattr(inst, field)) for field in fields.keys()]
-      else:
-        # Otherwise all fields of the struct must be present in the arguments
+      if node.keywords:
+        # Keyword arguments: map to field order
+        nargs = len(node.keywords)
+        nfields = len(fields.keys())
         if nargs != nfields:
           raise PyMTLSyntaxError( s.blk, node,
             f'BitStruct {obj.__name__} has {nfields} fields but {nargs} arguments are given!' )
-        values = [s.visit(arg) for arg in node.args]
+        values = [s.visit(node.keywords[i].value) for i in range(nargs)]
+      else:
+        nargs = len(node.args)
+        nfields = len(fields.keys())
+        if nargs == 0:
+          # Infer the values of each field by inspecting the object constructed
+          # with default arguments
+          inst = obj()
+          values = [s._datatype_to_bir(getattr(inst, field)) for field in fields.keys()]
+        else:
+          # Otherwise all fields of the struct must be present in the arguments
+          if nargs != nfields:
+            raise PyMTLSyntaxError( s.blk, node,
+              f'BitStruct {obj.__name__} has {nfields} fields but {nargs} arguments are given!' )
+          values = [s.visit(arg) for arg in node.args]
 
       ret = bir.StructInst( obj, values )
       ret.ast = node

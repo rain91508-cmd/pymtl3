@@ -547,14 +547,15 @@ class BehavioralRTLIRToVVisitorL1( bir.BehavioralRTLIRNodeVisitor ):
 
   def visit_Slice( s, node ):
     node.value._top_expr = True
-    node.lower._top_expr = True
-    node.upper._top_expr = True
+    if node.lower is not None:
+      node.lower._top_expr = True
+    if node.upper is not None:
+      node.upper._top_expr = True
 
-    lower = s.visit( node.lower )
     value = s.visit( node.value )
 
     # Check for +: syntax
-    if node.base and node.size:
+    if hasattr(node, 'base') and node.base is not None and node.size:
       size = int( node.size )
       base = s.visit( node.base )
 
@@ -562,14 +563,31 @@ class BehavioralRTLIRToVVisitorL1( bir.BehavioralRTLIRNodeVisitor ):
 
     # Regular [ lower : upper ] syntax
     else:
-      if hasattr( node.upper, '_value' ):
-        upper = str( int( node.upper._value - 1 ) )
-        nbits = node.upper.Type.get_dtype().get_length()
-        upper = f"{nbits}'d{upper}"
-      else:
-        upper = s.visit( node.upper ) + '-1'
+      if node.lower is None and node.upper is not None:
+        # x[:N] — take lower N bits
+        if hasattr( node.upper, '_value' ):
+          upper = str( int( node.upper._value - 1 ) )
+          nbits = node.upper.Type.get_dtype().get_length()
+          upper = f"{nbits}'d{upper}"
+        else:
+          upper = s.visit( node.upper ) + ' - 1'
+        return f'{value}[{upper}:0]'
 
-      return f'{value}[{upper}:{lower}]'
+      elif node.upper is None and node.lower is not None:
+        # x[N:] — take upper bits
+        lower = s.visit( node.lower )
+        return f'{value}[{lower}+:{node.size}]'
+
+      else:
+        lower = s.visit( node.lower )
+        if hasattr( node.upper, '_value' ):
+          upper = str( int( node.upper._value - 1 ) )
+          nbits = node.upper.Type.get_dtype().get_length()
+          upper = f"{nbits}'d{upper}"
+        else:
+          upper = s.visit( node.upper ) + ' - 1'
+
+        return f'{value}[{upper}:{lower}]'
 
   #-----------------------------------------------------------------------
   # visit_Base
