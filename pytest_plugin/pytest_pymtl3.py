@@ -61,7 +61,11 @@ def no_translation( request ):
     pytest.skip("skipping untranslatable test cases with --test-verilog or --test-yosys-verilog")
 
 def pytest_configure(config):
-  pass
+  # Don't write *.pyc and __pycache__ files.
+  # Replaces the removed pytest_cmdline_preparse hook (deprecated in
+  # pytest 7, removed in pytest 8).
+  import sys
+  sys.dont_write_bytecode = True
 
 def pytest_unconfigure(config):
   pass
