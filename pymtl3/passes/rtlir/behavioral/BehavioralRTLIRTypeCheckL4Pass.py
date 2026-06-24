@@ -36,7 +36,7 @@ class BehavioralRTLIRTypeCheckVisitorL4( BehavioralRTLIRTypeCheckVisitorL3 ):
     if isinstance( node.value.Type, rt.InterfaceView ):
       if not node.value.Type.has_property( node.attr ):
         raise PyMTLTypeError( s.blk, node.ast,
-          f'{dtype.get_name()} does not have field {node.attr}!' )
+          f'{node.value.Type.get_name()} does not have field {node.attr}!' )
       node.Type = node.value.Type.get_property( node.attr )
       # The attribute of an interface is always non-constant
       node._is_explicit = True
