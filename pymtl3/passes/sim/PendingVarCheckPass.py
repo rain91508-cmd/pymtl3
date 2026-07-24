@@ -231,7 +231,15 @@ class _PendingVarVisitor(ast.NodeVisitor):
             tree = ast.parse(dedented)
         except SyntaxError:
             return []
-        self.visit(tree)
+        try:
+            self.visit(tree)
+        except Exception as e:
+            # Defensive: real-world models may contain AST constructs the
+            # visitor doesn't handle. Skip this block rather than crash the
+            # whole pass.
+            print(f"[PendingVarCheck] WARNING: AST visitor failed on "
+                  f"{block_name}: {e}", file=sys.stderr)
+            return []
         for acc in self.accesses:
             if not acc.method_or_block:
                 acc.method_or_block = block_name
@@ -260,7 +268,10 @@ class PendingVarCheckPass(BasePass):
         all_uponce = top.get_all_update_once()
         blk_info = {}
         for blk in all_uponce:
-            name = blk.__name__
+            try:
+                name = blk.__name__
+            except Exception:
+                name = repr(blk)
             try:
                 host = top.get_update_block_host_component(blk)
             except Exception:
@@ -287,43 +298,61 @@ class PendingVarCheckPass(BasePass):
         )
         callee_info = {}
         for callee in all_callees:
-            # callee.method is a CalleePort; .method.method is the func
-            if callee.method is None or callee.method.method is None:
+            try:
+                # callee.method is a CalleePort; .method.method is the func
+                if callee.method is None or callee.method.method is None:
+                    continue
+                method = callee.method.method
+                try:
+                    src = inspect.getsource(method)
+                except (TypeError, OSError):
+                    src = None
+                try:
+                    host = callee.get_parent_object()
+                except Exception:
+                    host = None
+                # Prefer the interface's declared name (e.g. "recv") over
+                # the inner function's __name__ (e.g. "_recv_method") so
+                # suggestion messages reference the user-facing attribute.
+                name = (getattr(callee._dsl, 'my_name', None)
+                        or getattr(method, '__name__', str(method)))
+                callee_info[callee] = {
+                    'name': name,
+                    'host': host,
+                    'src': src,
+                    'accesses': [],
+                    'method_obj': method,
+                }
+            except Exception as e:
+                # Defensive: skip any callee whose structure we can't
+                # introspect (e.g. dynamically generated wrappers).
+                print(f"[PendingVarCheck] WARNING: could not collect callee "
+                      f"{callee!r}: {e}", file=sys.stderr)
                 continue
-            method = callee.method.method
-            try:
-                src = inspect.getsource(method)
-            except (TypeError, OSError):
-                src = None
-            try:
-                host = callee.get_parent_object()
-            except Exception:
-                host = None
-            # Prefer the interface's declared name (e.g. "recv") over
-            # the inner function's __name__ (e.g. "_recv_method") so
-            # suggestion messages reference the user-facing attribute.
-            name = (getattr(callee._dsl, 'my_name', None)
-                    or getattr(method, '__name__', str(method)))
-            callee_info[callee] = {
-                'name': name,
-                'host': host,
-                'src': src,
-                'accesses': [],
-                'method_obj': method,
-            }
 
-        # 3. Analyze each block/method with the AST visitor
+        # 3. Analyze each block/method with the AST visitor.
+        # Each analysis is wrapped in try/except so that a single
+        # block/method that the visitor cannot handle never crashes the
+        # whole pass (this pass runs in DefaultPassGroup on EVERY model).
         for blk, info in blk_info.items():
             if info['src']:
-                visitor = _PendingVarVisitor()
-                accs = visitor.analyze(info['src'], info['name'])
-                info['accesses'] = accs
+                try:
+                    visitor = _PendingVarVisitor()
+                    accs = visitor.analyze(info['src'], info['name'])
+                    info['accesses'] = accs
+                except Exception as e:
+                    print(f"[PendingVarCheck] WARNING: could not analyze "
+                          f"block {info['name']}: {e}", file=sys.stderr)
 
         for callee, info in callee_info.items():
             if info['src']:
-                visitor = _PendingVarVisitor()
-                accs = visitor.analyze(info['src'], info['name'])
-                info['accesses'] = accs
+                try:
+                    visitor = _PendingVarVisitor()
+                    accs = visitor.analyze(info['src'], info['name'])
+                    info['accesses'] = accs
+                except Exception as e:
+                    print(f"[PendingVarCheck] WARNING: could not analyze "
+                          f"callee {info['name']}: {e}", file=sys.stderr)
 
         # 4. Build variable -> writers/readers map.
         # Use dicts keyed by the writer/reader object so that multiple

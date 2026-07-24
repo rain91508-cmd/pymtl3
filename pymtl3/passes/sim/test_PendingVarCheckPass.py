@@ -112,3 +112,23 @@ def test_detect_cl_discipline_violation():
     v = violations[0]
     assert v.kind == "cl_discipline"
     assert "state_x" in v.var_name
+
+
+# DefaultPassGroup is re-exported at the top level (pymtl3/__init__.py
+# imports it from pymtl3.passes.PassGroups and lists it in __all__).
+from pymtl3 import DefaultPassGroup
+
+
+def test_default_pass_group_includes_check():
+    """DefaultPassGroup should run PendingVarCheckPass automatically
+    in warning mode (no raise)."""
+    dut = SimplePendingModel()  # has missing M<U constraint
+    try:
+        dut.apply(DefaultPassGroup())
+    except Exception as e:
+        pytest.fail(f"DefaultPassGroup should not raise in warning mode, got: {e}")
+
+    # In strict mode, it should raise
+    dut2 = SimplePendingModel()
+    with pytest.raises(Exception, match="PendingVarCheckPass"):
+        dut2.apply(DefaultPassGroup(strict_check=True))

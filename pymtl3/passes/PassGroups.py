@@ -2,6 +2,7 @@ from .autotick.OpenLoopCLPass import OpenLoopCLPass
 from .BasePass import BasePass
 from .sim.DynamicSchedulePass import DynamicSchedulePass
 from .sim.GenDAGPass import GenDAGPass
+from .sim.PendingVarCheckPass import PendingVarCheckPass
 from .sim.PrepareSimPass import PrepareSimPass
 from .sim.SimpleSchedulePass import SimpleSchedulePass
 from .sim.SimpleTickPass import SimpleTickPass
@@ -17,6 +18,7 @@ class SimpleSimPass( BasePass ):
   def __call__( s, top ):
     LineTraceParamPass()( top )
     GenDAGPass()( top )
+    PendingVarCheckPass()( top )
     WrapGreenletPass()( top )
     SimpleSchedulePass()( top )
     CLLineTracePass()( top )
@@ -27,12 +29,14 @@ class SimpleSimPass( BasePass ):
 
 class DefaultPassGroup( BasePass ):
   def __init__( s, *, vcdwave=None, textwave=False,
-                      linetrace=False, reset_active_high=True ):
+                      linetrace=False, reset_active_high=True,
+                      strict_check=False ):
 
     s.vcdwave = vcdwave
     s.textwave = textwave
     s.linetrace = linetrace
     s.reset_active_high = reset_active_high
+    s.strict_check = strict_check
 
   def __call__( s, top ):
 
@@ -44,6 +48,7 @@ class DefaultPassGroup( BasePass ):
 
     LineTraceParamPass()( top )
     GenDAGPass()( top )
+    PendingVarCheckPass(strict=s.strict_check)( top )
     WrapGreenletPass()( top )
     CLLineTracePass()( top )
     DynamicSchedulePass()( top )
