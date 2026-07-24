@@ -56,3 +56,31 @@ def test_detect_missing_m_u_constraint():
     assert "pending_x" in v.var_name
     assert "recv" in v.writer_name
     assert "up_process" in v.reader_name
+
+
+class ConstrainedPendingModel(Component):
+    """Same as SimplePendingModel but WITH M<U constraint."""
+    def construct(s):
+        s.pending_x = None
+
+        def _recv_method(msg):
+            s.pending_x = msg
+        s.recv = CalleeIfcCL(method=_recv_method, rdy=lambda: True)
+
+        @update_once
+        def up_process():
+            if s.pending_x is not None:
+                _ = s.pending_x
+                s.pending_x = None
+        s.up_process = up_process
+
+        s.add_constraints(M(s.recv) < U(up_process))
+
+
+def test_no_violation_when_constraint_exists():
+    """When M(recv) < U(up_process) is declared, no violation."""
+    dut = ConstrainedPendingModel()
+    dut.elaborate()
+    GenDAGPass()(dut)
+    violations = PendingVarCheckPass()(dut)
+    assert len(violations) == 0, f"Expected 0 violations, got {violations}"

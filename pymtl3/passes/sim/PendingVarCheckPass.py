@@ -319,6 +319,14 @@ class PendingVarCheckPass(BasePass):
         # accesses within the same block/method collapse into a single
         # entry (e.g. two reads of s.pending_x in one block should only
         # produce one reader entry, not two).
+        #
+        # IMPORTANT: for M-kind (CalleeIfcCL) entries we key by and store
+        # the underlying method FUNCTION (callee.method.method), not the
+        # CalleeIfcCL wrapper. GenDAGPass stores M<U / M<M constraints
+        # involving top-level callee ports in `top_level_callee_constraints`
+        # as (method_func, blk_func) tuples -- the function identity, not
+        # the wrapper, is what matches. Using the wrapper here would cause
+        # false positives because `wrapper is func` is always False.
         var_writers = {}  # var_name -> dict {obj: (name, host, obj, kind)}
         var_readers = {}  # var_name -> dict {obj: (name, host, obj, kind)}
 
@@ -334,18 +342,32 @@ class PendingVarCheckPass(BasePass):
                     )
 
         for callee, info in callee_info.items():
+            method_obj = info['method_obj']  # the actual method function
             for acc in info['accesses']:
                 if acc.access_type == "write":
-                    var_writers.setdefault(acc.var_name, {})[callee] = (
-                        info['name'], info['host'], callee, 'M'
+                    var_writers.setdefault(acc.var_name, {})[method_obj] = (
+                        info['name'], info['host'], method_obj, 'M'
                     )
                 elif acc.access_type == "read":
-                    var_readers.setdefault(acc.var_name, {})[callee] = (
-                        info['name'], info['host'], callee, 'M'
+                    var_readers.setdefault(acc.var_name, {})[method_obj] = (
+                        info['name'], info['host'], method_obj, 'M'
                     )
 
-        # 5. Check for missing constraints
+        # 5. Check for missing constraints.
+        # PyMTL3's GenDAGPass stores constraint tuples in two places:
+        #   - `all_constraints`: U<U pairs (and M-pairs propagated through
+        #     calling update blocks, i.e. when the callee is invoked from
+        #     inside an @update block).
+        #   - `top_level_callee_constraints`: (method_func, blk_or_method_func)
+        #     pairs for M<U / M<M constraints where the callee is a top-level
+        #     port (invoked by the simulator, not by an update block). These
+        #     pairs do NOT appear in `all_constraints`, so we must consult
+        #     both sets; otherwise every top-level CalleeIfcCL that shares a
+        #     pending_* var with an @update block would be a false positive.
         all_constraints = top._dag.all_constraints
+        top_level_callee_constraints = getattr(
+            top._dag, 'top_level_callee_constraints', set()
+        )
 
         for var_name in var_writers:
             writers = list(var_writers[var_name].values())
@@ -359,7 +381,8 @@ class PendingVarCheckPass(BasePass):
 
                     # Check if constraint already exists
                     has_constraint = self._has_constraint(
-                        all_constraints, writer_obj, writer_kind,
+                        all_constraints, top_level_callee_constraints,
+                        writer_obj, writer_kind,
                         reader_obj, reader_kind
                     )
 
@@ -443,31 +466,37 @@ class PendingVarCheckPass(BasePass):
 
         return violations
 
-    def _has_constraint(self, all_constraints, writer_obj, writer_kind,
-                        reader_obj, reader_kind):
+    def _has_constraint(self, all_constraints, top_level_callee_constraints,
+                        writer_obj, writer_kind, reader_obj, reader_kind):
         """Check if a constraint exists between writer and reader in the
-        constraint graph."""
+        constraint graph.
+
+        PyMTL3's GenDAGPass stores M-involving constraints for top-level
+        callee ports in `top_level_callee_constraints` (as
+        (method_func, blk_or_method_func) tuples), NOT in `all_constraints`.
+        The latter only contains U<U pairs and M-pairs that have been
+        propagated through a calling update block. To avoid false positives
+        on top-level CalleeIfcCL ports (the common case: recv/recv_rdy
+        invoked by the simulator), we consult both sets whenever at least
+        one side is an M-kind entity.
+
+        `writer_obj` / `reader_obj` for M-kind entries are the underlying
+        method FUNCTIONS (callee.method.method), matching the identity used
+        by GenDAGPass when it builds `top_level_callee_constraints`.
+        """
+        # U<U: both are update blocks -- only stored in all_constraints.
+        if writer_kind == 'U' and reader_kind == 'U':
+            for (u, v) in all_constraints:
+                if u is writer_obj and v is reader_obj:
+                    return True
+            return False
+
+        # M<U, U<M, M<M: at least one side is a method. Check both the
+        # top-level callee constraint set and the propagated U<U set.
+        for (u, v) in top_level_callee_constraints:
+            if u is writer_obj and v is reader_obj:
+                return True
         for (u, v) in all_constraints:
-            # U<U: both are update blocks
-            if writer_kind == 'U' and reader_kind == 'U':
-                if u is writer_obj and v is reader_obj:
-                    return True
-            # M<U: writer is method, reader is update block
-            # In the constraint graph, M constraints are stored as
-            # (method_func, update_blk_func) tuples
-            elif writer_kind == 'M' and reader_kind == 'U':
-                if u is writer_obj and v is reader_obj:
-                    return True
-                # Also check .rdy variant
-                if hasattr(writer_obj, 'rdy'):
-                    if u is writer_obj.rdy and v is reader_obj:
-                        return True
-            # U<M: writer is update block, reader is method
-            elif writer_kind == 'U' and reader_kind == 'M':
-                if u is writer_obj and v is reader_obj:
-                    return True
-            # M<M: both are methods
-            elif writer_kind == 'M' and reader_kind == 'M':
-                if u is writer_obj and v is reader_obj:
-                    return True
+            if u is writer_obj and v is reader_obj:
+                return True
         return False
