@@ -74,8 +74,19 @@ class _PendingVarVisitor(ast.NodeVisitor):
 
     def _get_full_name(self, node):
         """Extract dotted name from an AST node. Returns list of parts
-        or None if not a simple dotted name."""
+        or None if not a simple dotted name.
+
+        Peels off Subscript wrappers (e.g. s.state_x[0] -> s.state_x) so
+        that subscripted reads/writes of tracked variables are recognized
+        as accesses to the underlying tracked name (state_x). Without
+        this, `s.state_x[0] = msg` would be missed entirely -- the
+        Subscript node is not an Attribute, so the Attribute-extraction
+        loop below would not extract 's.state_x', and _handle_target /
+        visit_Subscript would record nothing.
+        """
         parts = []
+        while isinstance(node, ast.Subscript):
+            node = node.value
         while isinstance(node, ast.Attribute):
             parts.append(node.attr)
             node = node.value

@@ -84,3 +84,31 @@ def test_no_violation_when_constraint_exists():
     GenDAGPass()(dut)
     violations = PendingVarCheckPass()(dut)
     assert len(violations) == 0, f"Expected 0 violations, got {violations}"
+
+
+class StateWriteViolationModel(Component):
+    """CalleeIfcCL writes state_* directly — CL discipline violation."""
+    def construct(s):
+        s.state_x = [0]
+
+        def _recv_method(msg):
+            s.state_x[0] = msg  # Direct state_* write by CalleeIfcCL
+        s.recv = CalleeIfcCL(method=_recv_method, rdy=lambda: True)
+
+        @update_once
+        def up_process():
+            _ = s.state_x[0]
+        s.up_process = up_process
+
+
+def test_detect_cl_discipline_violation():
+    """CalleeIfcCL writing state_* should be flagged as CL discipline
+    violation."""
+    dut = StateWriteViolationModel()
+    dut.elaborate()
+    GenDAGPass()(dut)
+    violations = PendingVarCheckPass()(dut)
+    assert len(violations) >= 1
+    v = violations[0]
+    assert v.kind == "cl_discipline"
+    assert "state_x" in v.var_name
