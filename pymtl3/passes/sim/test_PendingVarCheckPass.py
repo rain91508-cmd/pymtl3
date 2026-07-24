@@ -114,6 +114,59 @@ def test_detect_cl_discipline_violation():
     assert "state_x" in v.var_name
 
 
+class SharedAppendListModel(Component):
+    """Two CalleeIfcCL methods both .append() to the same pending list
+    (write-only), and an @update_once reads+clears it. With M<U
+    constraints declared, there should be NO violations.
+
+    This models the FUPool pending_fast_path_completes pattern where
+    fu_operand_int/fu_operand_float/... all append and up_fire_completions
+    drains. Before the visit_Call fix, .append() was recorded as both
+    write AND read (via generic_visit on node.func), creating spurious
+    M<M violations between the appending methods.
+    """
+    def construct(s):
+        s.pending_list = []
+
+        def _writer_a(msg):
+            s.pending_list.append(msg)
+        s.writer_a = CalleeIfcCL(method=_writer_a, rdy=lambda: True)
+
+        def _writer_b(msg):
+            s.pending_list.append(msg)
+        s.writer_b = CalleeIfcCL(method=_writer_b, rdy=lambda: True)
+
+        @update_once
+        def up_drain():
+            for i in range(len(s.pending_list)):
+                _ = s.pending_list[i]
+            s.pending_list = []
+        s.up_drain = up_drain
+
+        s.add_constraints(
+            M(s.writer_a) < U(up_drain),
+            M(s.writer_b) < U(up_drain),
+        )
+
+
+def test_append_is_write_only_no_spurious_m_m():
+    """.append() on a shared pending_* list must be recorded as write-only,
+    not write+read. Without the fix, generic_visit on the Call's func
+    triggers visit_Attribute on the receiver, recording a spurious READ
+    that creates M<M violations between the appending methods."""
+    dut = SharedAppendListModel()
+    dut.elaborate()
+    GenDAGPass()(dut)
+    violations = PendingVarCheckPass()(dut)
+    assert len(violations) == 0, (
+        f"Expected 0 violations (M<U constraints exist, .append() is "
+        f"write-only), got {len(violations)}: "
+        + "; ".join(
+            f"{v.kind}:{v.writer_name}->{v.reader_name}" for v in violations
+        )
+    )
+
+
 # DefaultPassGroup is re-exported at the top level (pymtl3/__init__.py
 # imports it from pymtl3.passes.PassGroups and lists it in __all__).
 from pymtl3 import DefaultPassGroup

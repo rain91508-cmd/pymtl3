@@ -128,6 +128,7 @@ class _PendingVarVisitor(ast.NodeVisitor):
     def visit_Call(self, node):
         # Detect s.pending_x.append(...), s.pending_x.clear(), etc.
         func_name = self._get_full_name(node.func)
+        is_mutating = False
         if func_name and len(func_name) >= 3:
             if func_name[0] == 's' and _VAR_PATTERN.match(func_name[1]):
                 # s.pending_x.append(...) -> write
@@ -140,7 +141,22 @@ class _PendingVarVisitor(ast.NodeVisitor):
                         var_name=func_name[1], access_type="write",
                         method_or_block=""
                     ))
-        self.generic_visit(node)
+                    is_mutating = True
+        if is_mutating:
+            # Only visit args/kwargs, NOT node.func. Visiting node.func
+            # would trigger visit_Attribute on the receiver (s.pending_x),
+            # recording a spurious READ -- but accessing the bound .append
+            # method is part of the write, not a separate read of the list
+            # contents. This false read caused spurious M<M violations
+            # between CalleeIfcCL methods that all .append() to the same
+            # pending list (e.g. fu_operand_int/fu_operand_float sharing
+            # pending_fast_path_completes in FUPool).
+            for arg in node.args:
+                self.visit(arg)
+            for kw in node.keywords:
+                self.visit(kw.value)
+        else:
+            self.generic_visit(node)
 
     def visit_Attribute(self, node):
         # Detect s.pending_x read/write
