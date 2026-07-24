@@ -10,7 +10,221 @@ missing ordering constraints between CalleeIfcCL methods and
 
 Run after GenDAGPass, before SimpleSchedulePass/DynamicSchedulePass.
 """
-from pymtl3.passes.BasePass import BasePass, PassMetadata
+import ast
+import inspect
+import sys
+import re
+import textwrap
+from dataclasses import dataclass, field
+from typing import Optional
+
+from pymtl3.passes.BasePass import BasePass
+
+
+# Variables to track: pending_*, next_*, state_* (with optional _ prefix)
+_VAR_PATTERN = re.compile(r'^_?(pending_|next_|state_)')
+
+
+@dataclass
+class VarAccess:
+    """A single access to a tracked variable."""
+    var_name: str          # e.g. "pending_fast_path_completes"
+    access_type: str       # "read" or "write"
+    method_or_block: str   # human-readable name of the method/block
+
+
+@dataclass
+class Violation:
+    """A detected constraint violation."""
+    kind: str              # "missing_m_u", "missing_u_u", "missing_m_m",
+                           # "cl_discipline", "constraint_cycle"
+    var_name: str          # the shared variable
+    writer_name: str       # method/block that writes
+    reader_name: str       # method/block that reads
+    message: str           # human-readable description
+    suggestion: str = ""   # suggested fix
+
+
+class _PendingVarVisitor(ast.NodeVisitor):
+    """AST visitor that tracks reads/writes of pending_*/next_*/state_*
+    variables accessed via s.* attributes.
+
+    Tracks:
+    - Direct read: s.pending_x, for x in s.pending_x, len(s.pending_x)
+    - Direct write: s.pending_x = ..., s.pending_x.append(...),
+      s.pending_x.clear(), s.pending_x = []
+    - Indirect field write: b.field = val (where b was assigned from
+      a tracked variable, e.g. b = s.state_complete[fu])
+    """
+
+    def __init__(self):
+        self.accesses = []        # list of VarAccess
+        self._alias_map = {}      # local_var -> tracked_var_name
+
+    def _is_tracked_name(self, name_parts):
+        """Check if a dotted name like ['s', 'pending_x'] refers to a
+        tracked variable. Returns the variable name or None."""
+        if len(name_parts) < 2:
+            return None
+        if name_parts[0] != 's':
+            return None
+        if _VAR_PATTERN.match(name_parts[1]):
+            return name_parts[1]
+        return None
+
+    def _get_full_name(self, node):
+        """Extract dotted name from an AST node. Returns list of parts
+        or None if not a simple dotted name."""
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        else:
+            return None
+        parts.reverse()
+        return parts
+
+    def visit_Assign(self, node):
+        # Visit value first (reads on RHS)
+        self.visit(node.value)
+        # Then visit targets (writes)
+        for target in node.targets:
+            self._handle_target(target)
+
+    def visit_AugAssign(self, node):
+        # e.g. s.pending_x += 1 (both read and write)
+        self.visit(node.target)
+        self.visit(node.value)
+
+    def visit_For(self, node):
+        # for x in s.pending_x:  -> read of s.pending_x
+        # Also track alias: x = element from s.pending_x
+        iter_name = self._get_full_name(node.iter)
+        if iter_name:
+            tracked = self._is_tracked_name(iter_name)
+            if tracked:
+                self.accesses.append(VarAccess(
+                    var_name=tracked, access_type="read",
+                    method_or_block=""
+                ))
+                # Track loop variable as alias
+                if isinstance(node.target, ast.Name):
+                    self._alias_map[node.target.id] = tracked
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        # Detect s.pending_x.append(...), s.pending_x.clear(), etc.
+        func_name = self._get_full_name(node.func)
+        if func_name and len(func_name) >= 3:
+            if func_name[0] == 's' and _VAR_PATTERN.match(func_name[1]):
+                # s.pending_x.append(...) -> write
+                mutating_methods = {
+                    'append', 'extend', 'clear', 'pop', 'insert',
+                    'remove', 'popitem', 'setdefault', 'update',
+                }
+                if func_name[2] in mutating_methods:
+                    self.accesses.append(VarAccess(
+                        var_name=func_name[1], access_type="write",
+                        method_or_block=""
+                    ))
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):
+        # Detect s.pending_x read/write
+        name_parts = self._get_full_name(node)
+        if name_parts:
+            tracked = self._is_tracked_name(name_parts)
+            if tracked:
+                if isinstance(node.ctx, ast.Load):
+                    self.accesses.append(VarAccess(
+                        var_name=tracked, access_type="read",
+                        method_or_block=""
+                    ))
+                elif isinstance(node.ctx, ast.Store):
+                    self.accesses.append(VarAccess(
+                        var_name=tracked, access_type="write",
+                        method_or_block=""
+                    ))
+        self.generic_visit(node)
+
+    def visit_Subscript(self, node):
+        # s.pending_x[0] read, or s.state_complete[fu] read
+        name_parts = self._get_full_name(node)
+        if name_parts:
+            tracked = self._is_tracked_name(name_parts)
+            if tracked:
+                if isinstance(node.ctx, ast.Load):
+                    self.accesses.append(VarAccess(
+                        var_name=tracked, access_type="read",
+                        method_or_block=""
+                    ))
+                    # Track alias: b = s.state_complete[fu]
+                    # (handled in visit_Assign via _handle_target)
+                elif isinstance(node.ctx, ast.Store):
+                    self.accesses.append(VarAccess(
+                        var_name=tracked, access_type="write",
+                        method_or_block=""
+                    ))
+        self.generic_visit(node)
+
+    def _handle_target(self, target):
+        """Handle assignment targets, including alias tracking."""
+        if isinstance(target, ast.Name):
+            # Plain assignment: x = ... (may be alias from RHS)
+            pass  # alias tracking handled in visit_Assign
+        elif isinstance(target, ast.Attribute):
+            # Could be s.pending_x = ... or b.field = ...
+            name_parts = self._get_full_name(target)
+            if name_parts:
+                tracked = self._is_tracked_name(name_parts)
+                if tracked:
+                    self.accesses.append(VarAccess(
+                        var_name=tracked, access_type="write",
+                        method_or_block=""
+                    ))
+                elif len(name_parts) == 2 and name_parts[0] in self._alias_map:
+                    # Indirect field write: b.field = val where b is aliased
+                    # to a tracked variable
+                    tracked_var = self._alias_map[name_parts[0]]
+                    self.accesses.append(VarAccess(
+                        var_name=tracked_var, access_type="write",
+                        method_or_block=""
+                    ))
+        elif isinstance(target, ast.Subscript):
+            # s.pending_x[i] = ... or b[i] = ...
+            name_parts = self._get_full_name(target)
+            if name_parts:
+                tracked = self._is_tracked_name(name_parts)
+                if tracked:
+                    self.accesses.append(VarAccess(
+                        var_name=tracked, access_type="write",
+                        method_or_block=""
+                    ))
+                elif name_parts[0] in self._alias_map:
+                    tracked_var = self._alias_map[name_parts[0]]
+                    self.accesses.append(VarAccess(
+                        var_name=tracked_var, access_type="write",
+                        method_or_block=""
+                    ))
+
+    def analyze(self, source_code, block_name=""):
+        """Parse and analyze source code. Returns list of VarAccess.
+
+        The source is dedented before parsing to handle nested functions
+        (inspect.getsource returns indented source for closures).
+        """
+        try:
+            dedented = textwrap.dedent(source_code)
+            tree = ast.parse(dedented)
+        except SyntaxError:
+            return []
+        self.visit(tree)
+        for acc in self.accesses:
+            if not acc.method_or_block:
+                acc.method_or_block = block_name
+        return self.accesses
 
 
 class PendingVarCheckPass(BasePass):
@@ -26,5 +240,234 @@ class PendingVarCheckPass(BasePass):
 
     def __call__(self, top):
         violations = []
-        # TODO: implement analysis
+
+        # 1. Collect all update_once blocks and their source.
+        # Use inspect.getsource directly on the function object for a
+        # uniform approach that works regardless of which component
+        # class caches the metadata. The source is dedented inside
+        # _PendingVarVisitor.analyze.
+        all_uponce = top.get_all_update_once()
+        blk_info = {}
+        for blk in all_uponce:
+            name = blk.__name__
+            try:
+                host = top.get_update_block_host_component(blk)
+            except Exception:
+                host = None
+            try:
+                src = inspect.getsource(blk)
+            except (TypeError, OSError):
+                src = None
+            blk_info[blk] = {
+                'name': name,
+                'host': host,
+                'src': src,
+                'accesses': [],
+            }
+
+        # 2. Collect all CalleeIfcCL methods and their source.
+        # NOTE: callee.method is a CalleePort wrapper, not the function.
+        # The actual function is callee.method.method. Using callee.method
+        # directly would make inspect.getsource fail (it would try to
+        # fetch source for the CalleePort class, not the user method).
+        from pymtl3.dsl.Connectable import CalleeIfcCL, CallerIfcCL
+        all_callees = top.get_all_object_filter(
+            lambda x: isinstance(x, CalleeIfcCL)
+        )
+        callee_info = {}
+        for callee in all_callees:
+            # callee.method is a CalleePort; .method.method is the func
+            if callee.method is None or callee.method.method is None:
+                continue
+            method = callee.method.method
+            try:
+                src = inspect.getsource(method)
+            except (TypeError, OSError):
+                src = None
+            try:
+                host = callee.get_parent_object()
+            except Exception:
+                host = None
+            # Prefer the interface's declared name (e.g. "recv") over
+            # the inner function's __name__ (e.g. "_recv_method") so
+            # suggestion messages reference the user-facing attribute.
+            name = (getattr(callee._dsl, 'my_name', None)
+                    or getattr(method, '__name__', str(method)))
+            callee_info[callee] = {
+                'name': name,
+                'host': host,
+                'src': src,
+                'accesses': [],
+                'method_obj': method,
+            }
+
+        # 3. Analyze each block/method with the AST visitor
+        for blk, info in blk_info.items():
+            if info['src']:
+                visitor = _PendingVarVisitor()
+                accs = visitor.analyze(info['src'], info['name'])
+                info['accesses'] = accs
+
+        for callee, info in callee_info.items():
+            if info['src']:
+                visitor = _PendingVarVisitor()
+                accs = visitor.analyze(info['src'], info['name'])
+                info['accesses'] = accs
+
+        # 4. Build variable -> writers/readers map.
+        # Use dicts keyed by the writer/reader object so that multiple
+        # accesses within the same block/method collapse into a single
+        # entry (e.g. two reads of s.pending_x in one block should only
+        # produce one reader entry, not two).
+        var_writers = {}  # var_name -> dict {obj: (name, host, obj, kind)}
+        var_readers = {}  # var_name -> dict {obj: (name, host, obj, kind)}
+
+        for blk, info in blk_info.items():
+            for acc in info['accesses']:
+                if acc.access_type == "write":
+                    var_writers.setdefault(acc.var_name, {})[blk] = (
+                        info['name'], info['host'], blk, 'U'
+                    )
+                elif acc.access_type == "read":
+                    var_readers.setdefault(acc.var_name, {})[blk] = (
+                        info['name'], info['host'], blk, 'U'
+                    )
+
+        for callee, info in callee_info.items():
+            for acc in info['accesses']:
+                if acc.access_type == "write":
+                    var_writers.setdefault(acc.var_name, {})[callee] = (
+                        info['name'], info['host'], callee, 'M'
+                    )
+                elif acc.access_type == "read":
+                    var_readers.setdefault(acc.var_name, {})[callee] = (
+                        info['name'], info['host'], callee, 'M'
+                    )
+
+        # 5. Check for missing constraints
+        all_constraints = top._dag.all_constraints
+
+        for var_name in var_writers:
+            writers = list(var_writers[var_name].values())
+            readers = list(var_readers.get(var_name, {}).values())
+
+            for writer_name, writer_host, writer_obj, writer_kind in writers:
+                for reader_name, reader_host, reader_obj, reader_kind in readers:
+                    # Skip self-dependencies (same block reads and writes)
+                    if writer_obj is reader_obj:
+                        continue
+
+                    # Check if constraint already exists
+                    has_constraint = self._has_constraint(
+                        all_constraints, writer_obj, writer_kind,
+                        reader_obj, reader_kind
+                    )
+
+                    if not has_constraint:
+                        # Check for CL discipline violation
+                        # (CalleeIfcCL writing state_*)
+                        if writer_kind == 'M' and var_name.startswith(('state_', '_state_')):
+                            violations.append(Violation(
+                                kind="cl_discipline",
+                                var_name=var_name,
+                                writer_name=writer_name,
+                                reader_name=reader_name,
+                                message=(
+                                    f"CL discipline violation: CalleeIfcCL "
+                                    f"'{writer_name}' writes state_* variable "
+                                    f"'{var_name}' directly (bypasses @update_ff). "
+                                    f"Use pending_* instead."
+                                ),
+                            ))
+                        elif writer_kind == 'M' and reader_kind == 'U':
+                            violations.append(Violation(
+                                kind="missing_m_u",
+                                var_name=var_name,
+                                writer_name=writer_name,
+                                reader_name=reader_name,
+                                message=(
+                                    f"Missing M<U constraint: CalleeIfcCL "
+                                    f"'{writer_name}' writes '{var_name}', "
+                                    f"@update_once '{reader_name}' reads it. "
+                                    f"Add: M(s.{writer_name}) < U({reader_name})"
+                                ),
+                                suggestion=(
+                                    f"s.add_constraints(M(s.{writer_name}) < U({reader_name}))"
+                                ),
+                            ))
+                        elif writer_kind == 'U' and reader_kind == 'U':
+                            violations.append(Violation(
+                                kind="missing_u_u",
+                                var_name=var_name,
+                                writer_name=writer_name,
+                                reader_name=reader_name,
+                                message=(
+                                    f"Missing U<U constraint: @update_once "
+                                    f"'{writer_name}' writes '{var_name}', "
+                                    f"@update_once '{reader_name}' reads it. "
+                                    f"Add: U({writer_name}) < U({reader_name})"
+                                ),
+                                suggestion=(
+                                    f"s.add_constraints(U({writer_name}) < U({reader_name}))"
+                                ),
+                            ))
+                        elif writer_kind == 'M' and reader_kind == 'M':
+                            # M<M: check if callers have U<U
+                            violations.append(Violation(
+                                kind="missing_m_m",
+                                var_name=var_name,
+                                writer_name=writer_name,
+                                reader_name=reader_name,
+                                message=(
+                                    f"Missing M<M or U<U constraint: CalleeIfcCL "
+                                    f"'{writer_name}' writes '{var_name}', "
+                                    f"CalleeIfcCL '{reader_name}' reads it. "
+                                    f"Add M({writer_name}) < M({reader_name}), "
+                                    f"or add U<U between their calling blocks."
+                                ),
+                            ))
+
+        # 6. Print warnings or raise
+        if violations:
+            for v in violations:
+                print(f"[PendingVarCheck] {v.kind}: {v.message}",
+                      file=sys.stderr)
+                if v.suggestion:
+                    print(f"  Suggestion: {v.suggestion}", file=sys.stderr)
+
+            if self.strict:
+                raise Exception(
+                    f"PendingVarCheckPass found {len(violations)} violation(s). "
+                    f"Run without --strict to see warnings."
+                )
+
         return violations
+
+    def _has_constraint(self, all_constraints, writer_obj, writer_kind,
+                        reader_obj, reader_kind):
+        """Check if a constraint exists between writer and reader in the
+        constraint graph."""
+        for (u, v) in all_constraints:
+            # U<U: both are update blocks
+            if writer_kind == 'U' and reader_kind == 'U':
+                if u is writer_obj and v is reader_obj:
+                    return True
+            # M<U: writer is method, reader is update block
+            # In the constraint graph, M constraints are stored as
+            # (method_func, update_blk_func) tuples
+            elif writer_kind == 'M' and reader_kind == 'U':
+                if u is writer_obj and v is reader_obj:
+                    return True
+                # Also check .rdy variant
+                if hasattr(writer_obj, 'rdy'):
+                    if u is writer_obj.rdy and v is reader_obj:
+                        return True
+            # U<M: writer is update block, reader is method
+            elif writer_kind == 'U' and reader_kind == 'M':
+                if u is writer_obj and v is reader_obj:
+                    return True
+            # M<M: both are methods
+            elif writer_kind == 'M' and reader_kind == 'M':
+                if u is writer_obj and v is reader_obj:
+                    return True
+        return False
