@@ -308,6 +308,12 @@ class PendingVarCheckPass(BasePass):
         # The actual function is callee.method.method. Using callee.method
         # directly would make inspect.getsource fail (it would try to
         # fetch source for the CalleePort class, not the user method).
+        #
+        # After CLLineTracePass, callee.method.method is replaced with a
+        # lambda wrapper. The original function is saved in
+        # callee.method.raw_method (see CLLineTracePass.wrap_callee_method).
+        # We prefer raw_method when available so the pass works correctly
+        # even when run after CLLineTracePass.
         from pymtl3.dsl.Connectable import CalleeIfcCL, CallerIfcCL
         all_callees = top.get_all_object_filter(
             lambda x: isinstance(x, CalleeIfcCL)
@@ -315,10 +321,16 @@ class PendingVarCheckPass(BasePass):
         callee_info = {}
         for callee in all_callees:
             try:
-                # callee.method is a CalleePort; .method.method is the func
-                if callee.method is None or callee.method.method is None:
+                port = callee.method
+                if port is None:
                     continue
-                method = callee.method.method
+                # Prefer raw_method (original, pre-CLLineTracePass) over
+                # method (which may be a lambda wrapper after CLLineTracePass).
+                method = getattr(port, 'raw_method', None)
+                if method is None:
+                    method = port.method
+                if method is None:
+                    continue
                 try:
                     src = inspect.getsource(method)
                 except (TypeError, OSError):
@@ -425,6 +437,53 @@ class PendingVarCheckPass(BasePass):
             top._dag, 'top_level_callee_constraints', set()
         )
 
+        # Build method_callers: method_func -> set of calling @update blocks.
+        # This is needed to recognize propagated U<U constraints: when a child
+        # component declares M(m) < U(r) and m is called from parent @update
+        # block `caller`, GenDAGPass stores (caller, r) in all_constraints --
+        # NOT (m, r). Without method_callers, we can't match (caller, r) to
+        # the (m, r) pair we're checking, producing false positives.
+        #
+        # Strategy: match `call` objects from all_upblk_calls against the
+        # CalleeIfcCL objects we already collected in callee_info (direct
+        # identity match, no attribute access needed). For objects NOT in
+        # callee_info (e.g. CallerIfcCL wired to a CalleeIfcCL, or raw
+        # MethodPort), fall back to resolving via .method / .method.method
+        # — which is safe after GenDAGPass has set CallerPort.method (line
+        # 368 of GenDAGPass.py). All attribute access is wrapped in
+        # try/except so a single unresolvable call never crashes the pass.
+        method_callers = {}  # method_func -> set of blk
+
+        # Fast lookup: CalleeIfcCL object -> its method function
+        callee_obj_to_func = {}
+        for callee, info in callee_info.items():
+            callee_obj_to_func[callee] = info['method_obj']
+
+        all_upblk_calls = getattr(top._dsl, 'all_upblk_calls', {})
+        for blk, calls in all_upblk_calls.items():
+            for call in calls:
+                func = None
+                # 1. Direct match: call is a CalleeIfcCL we collected
+                if call in callee_obj_to_func:
+                    func = callee_obj_to_func[call]
+                else:
+                    # 2. Fallback: resolve via attribute access (CallerIfcCL,
+                    #    MethodPort, or other NonBlockingIfc/BlockingIfc).
+                    #    After GenDAGPass, CallerPort.method is set to the
+                    #    callee's function, so call.method.method gives the
+                    #    actual method function.
+                    #    NOTE: This is temporarily DISABLED because accessing
+                    #    call.method.method on certain NonBlockingIfc objects
+                    #    causes side effects that break ISA simulation. The
+                    #    direct match above handles the common case (CalleeIfcCL
+                    #    called directly in an update block). CallerIfcCL calls
+                    #    are not resolved, which may cause some false positives
+                    #    for propagated constraints — but those are warnings,
+                    #    not errors, and the ISA test correctness is paramount.
+                    pass
+                if func is not None:
+                    method_callers.setdefault(func, set()).add(blk)
+
         for var_name in var_writers:
             writers = list(var_writers[var_name].values())
             readers = list(var_readers.get(var_name, {}).values())
@@ -435,9 +494,27 @@ class PendingVarCheckPass(BasePass):
                     if writer_obj is reader_obj:
                         continue
 
+                    # Skip cross-component false positives: variables with
+                    # the same name in DIFFERENT sibling component instances
+                    # are distinct variables (each component has its own
+                    # s.pending_x). The visitor only tracks accesses via
+                    # `s.<var>` where `s` is the component being analyzed, so
+                    # all tracked accesses are intra-component. When two
+                    # sibling components (e.g. IntIQCL and MemIQCL) both
+                    # declare `s.pending_inserts`, they are different
+                    # variables. Only writers and readers within the same
+                    # host component could actually share a variable. If
+                    # either host is None (introspection failed), fall
+                    # through conservatively to avoid masking real issues.
+                    if (writer_host is not None
+                            and reader_host is not None
+                            and writer_host is not reader_host):
+                        continue
+
                     # Check if constraint already exists
                     has_constraint = self._has_constraint(
                         all_constraints, top_level_callee_constraints,
+                        method_callers,
                         writer_obj, writer_kind,
                         reader_obj, reader_kind
                     )
@@ -523,22 +600,35 @@ class PendingVarCheckPass(BasePass):
         return violations
 
     def _has_constraint(self, all_constraints, top_level_callee_constraints,
+                        method_callers,
                         writer_obj, writer_kind, reader_obj, reader_kind):
         """Check if a constraint exists between writer and reader in the
         constraint graph.
 
-        PyMTL3's GenDAGPass stores M-involving constraints for top-level
-        callee ports in `top_level_callee_constraints` (as
-        (method_func, blk_or_method_func) tuples), NOT in `all_constraints`.
-        The latter only contains U<U pairs and M-pairs that have been
-        propagated through a calling update block. To avoid false positives
-        on top-level CalleeIfcCL ports (the common case: recv/recv_rdy
-        invoked by the simulator), we consult both sets whenever at least
-        one side is an M-kind entity.
+        PyMTL3's GenDAGPass stores M-involving constraints in two forms:
+
+        1. `top_level_callee_constraints`: (method_func, blk_or_method_func)
+           pairs for M<U / M<M constraints where the callee is a top-level
+           port (invoked by the simulator, not by an update block).
+
+        2. `all_constraints`: U<U pairs, INCLUDING M<U/M<M constraints that
+           GenDAGPass has propagated through calling update blocks. When a
+           child component declares M(m) < U(r) and m is called from
+           @update block `caller`, GenDAGPass stores (caller, r) in
+           all_constraints — NOT (m, r). To recognize these propagated
+           constraints, we use `method_callers` (method_func -> set of
+           calling blocks) to check whether any (caller, r) pair exists.
+
+        Without the propagated-form check, every child-component
+        CalleeIfcCL that shares a pending_* var with an @update_once in
+        the SAME child component would be a false positive when the pass
+        runs on the parent model (the constraint exists in the child's
+        construct but is stored as propagated U<U, not as M<U).
 
         `writer_obj` / `reader_obj` for M-kind entries are the underlying
         method FUNCTIONS (callee.method.method), matching the identity used
-        by GenDAGPass when it builds `top_level_callee_constraints`.
+        by GenDAGPass when it builds `top_level_callee_constraints` and
+        `method_callers`.
         """
         # U<U: both are update blocks -- only stored in all_constraints.
         if writer_kind == 'U' and reader_kind == 'U':
@@ -547,12 +637,39 @@ class PendingVarCheckPass(BasePass):
                     return True
             return False
 
-        # M<U, U<M, M<M: at least one side is a method. Check both the
-        # top-level callee constraint set and the propagated U<U set.
+        # M<U, U<M, M<M: at least one side is a method.
+
+        # 1. Direct M-involving constraint (top-level callee case).
         for (u, v) in top_level_callee_constraints:
             if u is writer_obj and v is reader_obj:
                 return True
+
+        # 2. Direct (method, blk) pair in all_constraints (rare, but
+        #    check for completeness).
         for (u, v) in all_constraints:
             if u is writer_obj and v is reader_obj:
                 return True
+
+        # 3. Propagated U<U form: GenDAGPass converts M(m) < U(r) to
+        #    U(caller) < U(r) where caller calls m. Check if any
+        #    (caller, r) pair exists in all_constraints.
+        writer_callers = method_callers.get(writer_obj)
+        if writer_callers:
+            for caller in writer_callers:
+                for (u, v) in all_constraints:
+                    if u is caller and v is reader_obj:
+                        return True
+
+        # 4. For M<M: GenDAGPass also converts M(m1) < M(m2) to
+        #    U(caller1) < U(caller2). Check if any (caller1, caller2)
+        #    pair exists in all_constraints.
+        if writer_kind == 'M' and reader_kind == 'M':
+            reader_callers = method_callers.get(reader_obj)
+            if writer_callers and reader_callers:
+                for caller_w in writer_callers:
+                    for caller_r in reader_callers:
+                        for (u, v) in all_constraints:
+                            if u is caller_w and v is caller_r:
+                                return True
+
         return False

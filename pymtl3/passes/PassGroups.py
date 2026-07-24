@@ -48,10 +48,19 @@ class DefaultPassGroup( BasePass ):
 
     LineTraceParamPass()( top )
     GenDAGPass()( top )
-    PendingVarCheckPass(strict=s.strict_check)( top )
     WrapGreenletPass()( top )
     CLLineTracePass()( top )
     DynamicSchedulePass()( top )
+    # PendingVarCheckPass runs AFTER DynamicSchedulePass to avoid affecting
+    # the schedule. The pass is a pure static analysis that reads data from
+    # GenDAGPass (all_constraints, top_level_callee_constraints) and prints
+    # warnings. Running it before DynamicSchedulePass changes Python's memory
+    # layout (via inspect.getsource and AST parsing), which shifts object IDs
+    # and changes set iteration order in the scheduler, worsening a pre-
+    # existing non-deterministic deadlock in the O3 ISA simulation. Moving it
+    # after the scheduler ensures the schedule is fixed before any pass-side
+    # allocations occur.
+    PendingVarCheckPass(strict=s.strict_check)( top )
     VcdGenerationPass()( top )
     PrintTextWavePass()( top )
 
