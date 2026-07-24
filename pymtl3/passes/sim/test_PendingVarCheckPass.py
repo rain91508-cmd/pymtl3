@@ -332,16 +332,28 @@ def test_child_component_constraint_recognized():
 from pymtl3 import DefaultPassGroup
 
 
-def test_default_pass_group_includes_check():
-    """DefaultPassGroup should run PendingVarCheckPass automatically
-    in warning mode (no raise)."""
-    dut = SimplePendingModel()  # has missing M<U constraint
+def test_default_pass_group_opt_in_check():
+    """DefaultPassGroup pending-var check is opt-in via strict_check:
+      strict_check=None  (default) — pass does not run
+      strict_check=False             — warning mode (prints, no raise)
+      strict_check=True              — strict mode (raises on violations)
+    """
+    # Default: pass does NOT run. SimplePendingModel has a missing M<U
+    # constraint, but since the pass doesn't run, no exception.
+    dut = SimplePendingModel()
     try:
         dut.apply(DefaultPassGroup())
     except Exception as e:
-        pytest.fail(f"DefaultPassGroup should not raise in warning mode, got: {e}")
+        pytest.fail(f"DefaultPassGroup() should not run the pass, got: {e}")
 
-    # In strict mode, it should raise
+    # Warning mode: pass runs but does not raise.
     dut2 = SimplePendingModel()
+    try:
+        dut2.apply(DefaultPassGroup(strict_check=False))
+    except Exception as e:
+        pytest.fail(f"strict_check=False should not raise, got: {e}")
+
+    # Strict mode: pass runs and raises on the missing constraint.
+    dut3 = SimplePendingModel()
     with pytest.raises(Exception, match="PendingVarCheckPass"):
-        dut2.apply(DefaultPassGroup(strict_check=True))
+        dut3.apply(DefaultPassGroup(strict_check=True))

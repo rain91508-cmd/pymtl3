@@ -29,8 +29,8 @@ class SimpleSimPass( BasePass ):
 
 class DefaultPassGroup( BasePass ):
   def __init__( s, *, vcdwave=None, textwave=False,
-                      linetrace=False, reset_active_high=True,
-                      strict_check=False ):
+                    linetrace=False, reset_active_high=True,
+                    strict_check=None ):
 
     s.vcdwave = vcdwave
     s.textwave = textwave
@@ -51,21 +51,26 @@ class DefaultPassGroup( BasePass ):
     WrapGreenletPass()( top )
     CLLineTracePass()( top )
     DynamicSchedulePass()( top )
-    # PendingVarCheckPass runs AFTER DynamicSchedulePass to avoid affecting
-    # the schedule. The pass is a pure static analysis that reads data from
-    # GenDAGPass (all_constraints, top_level_callee_constraints) and prints
-    # warnings. Running it before DynamicSchedulePass changes Python's memory
-    # layout (via inspect.getsource and AST parsing), which shifts object IDs
-    # and changes set iteration order in the scheduler, worsening a pre-
-    # existing non-deterministic deadlock in the O3 ISA simulation. Moving it
-    # after the scheduler ensures the schedule is fixed before any pass-side
-    # allocations occur.
-    PendingVarCheckPass(strict=s.strict_check)( top )
     VcdGenerationPass()( top )
     PrintTextWavePass()( top )
 
     PrepareSimPass(print_line_trace=s.linetrace,
                    reset_active_high=s.reset_active_high)( top )
+    # PendingVarCheckPass is OPT-IN: only runs when strict_check is not None.
+    #   strict_check=None  (default) — pass does not run (safe for all tests)
+    #   strict_check=False             — runs in warning mode (prints to stderr)
+    #   strict_check=True              — runs in strict mode (raises on violations)
+    #
+    # The pass is a pure static analysis (reads _dag/_dsl metadata, prints
+    # warnings) with no writes to simulation state. However, it creates
+    # Python objects (VarAccess, Violation, AST nodes) whose allocation
+    # shifts Python's memory layout, which shifts set/greenlet iteration
+    # order in the simulation runtime. For models with pre-existing missing
+    # M<U constraints (e.g. O3 ISA tests), this worsens nondeterministic
+    # deadlocks. Running it after PrepareSimPass (model locked) and making it
+    # opt-in ensures zero impact on existing tests unless explicitly requested.
+    if s.strict_check is not None:
+      PendingVarCheckPass(strict=s.strict_check)( top )
 
 class AutoTickSimPass( BasePass ):
   def __init__( s, print_line_trace=True ):
