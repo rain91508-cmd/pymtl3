@@ -357,3 +357,69 @@ def test_default_pass_group_opt_in_check():
     dut3 = SimplePendingModel()
     with pytest.raises(Exception, match="PendingVarCheckPass"):
         dut3.apply(DefaultPassGroup(strict_check=True))
+
+
+class AugAssignCounterModel(Component):
+    """Multiple CalleeIfcCL methods all increment the same pending counter
+    via `s.pending_count[tid] += 1` (AugAssign). Each method is an
+    independent counter increment — the order between them does NOT matter
+    because addition is commutative.
+
+    Before the visit_AugAssign fix, the pass recorded the target as BOTH
+    read and write (via generic_visit on the Subscript's inner Attribute
+    with ctx=Load), creating false M<M cycles between all the incrementing
+    methods (e.g. fu_complete/lsq_execute_resp/direct_complete all do
+    s.pending_complete[tid] += 1 in WriteBackCL; ro_inst_issued_* all do
+    s.pending_issued[tid] += 1).
+    """
+    def construct(s):
+        s.pending_count = [0] * 4
+
+        def _incr_a(tid):
+            s.pending_count[tid] += 1
+        s.incr_a = CalleeIfcCL(method=_incr_a, rdy=lambda: True)
+
+        def _incr_b(tid):
+            s.pending_count[tid] += 1
+        s.incr_b = CalleeIfcCL(method=_incr_b, rdy=lambda: True)
+
+        def _incr_c(tid):
+            s.pending_count[tid] += 1
+        s.incr_c = CalleeIfcCL(method=_incr_c, rdy=lambda: True)
+
+        @update_once
+        def up_drain():
+            for tid in range(4):
+                s.pending_count[tid] = 0
+        s.up_drain = up_drain
+
+        s.add_constraints(
+            M(s.incr_a) < U(up_drain),
+            M(s.incr_b) < U(up_drain),
+            M(s.incr_c) < U(up_drain),
+        )
+
+
+def test_aug_assign_no_spurious_m_m_cycle():
+    """`s.pending_count[tid] += 1` is an atomic read-modify-write.
+    The pass must record it as WRITE only, not read+write. Recording a
+    read would create false M<M cycles between methods that all increment
+    the same counter.
+
+    Without the fix, incr_a/incr_b/incr_c would all be recorded as both
+    readers and writers of pending_count, producing 6 spurious M<M
+    violations (a→b, a→c, b→a, b→c, c→a, c→b). With the fix, only the
+    3 real M<U violations (incr_* → up_drain) are suppressed by the
+    declared constraints, and 0 violations remain.
+    """
+    dut = AugAssignCounterModel()
+    dut.elaborate()
+    GenDAGPass()(dut)
+    violations = PendingVarCheckPass()(dut)
+    m_m = [v for v in violations if v.kind == "missing_m_m"]
+    assert m_m == [], (
+        f"Expected 0 M<M violations (+= is write-only, no read), got "
+        f"{len(m_m)}: " + "; ".join(
+            f"{v.writer_name}->{v.reader_name}" for v in m_m
+        )
+    )

@@ -105,9 +105,25 @@ class _PendingVarVisitor(ast.NodeVisitor):
             self._handle_target(target)
 
     def visit_AugAssign(self, node):
-        # e.g. s.pending_x += 1 (both read and write)
-        self.visit(node.target)
+        # e.g. s.pending_x[tid] += 1 (atomic read-modify-write)
+        # Record ONLY a write on the target. The read is part of the
+        # atomic operation and does NOT create a data dependency on other
+        # methods' writes. Recording a read would create false M<M cycles
+        # between methods that all increment the same counter (e.g.
+        # fu_complete, lsq_execute_resp, direct_complete all do
+        # s.pending_complete[tid] += 1; ro_inst_issued_* all do
+        # s.pending_issued[tid] += 1).
+        #
+        # We use _handle_target (which records the write without visiting
+        # children) instead of self.visit(node.target) (which would dispatch
+        # to visit_Subscript/visit_Attribute and call generic_visit,
+        # recording a spurious READ via the inner Attribute's ctx=Load).
+        self._handle_target(node.target)
         self.visit(node.value)
+        # Visit Subscript slice for tracked variable reads in the index
+        # (e.g. s.pending_x[s.pending_y] += 1 — pending_y is read).
+        if isinstance(node.target, ast.Subscript):
+            self.visit(node.target.slice)
 
     def visit_For(self, node):
         # for x in s.pending_x:  -> read of s.pending_x
