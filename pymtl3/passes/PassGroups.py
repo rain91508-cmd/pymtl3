@@ -29,12 +29,14 @@ class SimpleSimPass( BasePass ):
 
 class DefaultPassGroup( BasePass ):
   def __init__( s, *, vcdwave=None, textwave=False,
-                    linetrace=False, reset_active_high=True,
+                    linetrace=False, cl_ifc_trace=False,
+                    reset_active_high=True,
                     strict_check=None ):
 
     s.vcdwave = vcdwave
     s.textwave = textwave
     s.linetrace = linetrace
+    s.cl_ifc_trace = cl_ifc_trace
     s.reset_active_high = reset_active_high
     s.strict_check = strict_check
 
@@ -45,6 +47,9 @@ class DefaultPassGroup( BasePass ):
 
     if s.textwave:
       top.set_metadata( PrintTextWavePass.enable, True )
+
+    if s.cl_ifc_trace:
+      top.set_metadata( CLLineTracePass.text_trace, True )
 
     LineTraceParamPass()( top )
     GenDAGPass()( top )

@@ -6,6 +6,10 @@
 # Author : Yanghui Ou
 #   Date : May 21, 2019
 
+import fnmatch
+import re
+import sys
+
 from pymtl3.dsl import *
 from pymtl3.passes.BasePass import BasePass
 
@@ -23,6 +27,48 @@ class CLLineTracePass( BasePass ):
 
   clear_cl_trace_func = MetadataKey()
 
+  #: text_trace
+  #:
+  #: Type: ``bool``; input
+  #:
+  #: Default value: False
+  text_trace = MetadataKey(bool)
+
+  #: text_trace_include
+  #:
+  #: Type: ``list[str]``; input
+  #:
+  #: Default value: ["*"]
+  text_trace_include = MetadataKey()
+
+  #: text_trace_exclude
+  #:
+  #: Type: ``list[str]``; input
+  #:
+  #: Default value: []
+  text_trace_exclude = MetadataKey()
+
+  #: text_trace_output
+  #:
+  #: Type: ``callable`` or ``TextIO``; input
+  #:
+  #: Default value: sys.stderr.write
+  text_trace_output = MetadataKey()
+
+  #: text_trace_max_len
+  #:
+  #: Type: ``int``; input
+  #:
+  #: Default value: 120
+  text_trace_max_len = MetadataKey(int)
+
+  #: text_trace_rdy
+  #:
+  #: Type: ``bool``; input
+  #:
+  #: Default value: False
+  text_trace_rdy = MetadataKey(bool)
+
   def __init__( self, default_trace_len=8 ):
     self.default_trace_len = default_trace_len
 
@@ -36,7 +82,67 @@ class CLLineTracePass( BasePass ):
 
     top.set_metadata( self.clear_cl_trace_func, self.process_component( top ) )
 
+  @staticmethod
+  def _compile_globs( patterns ):
+    if patterns is None:
+      return []
+    return [ re.compile( fnmatch.translate( p ) ) for p in patterns ]
+
+  @staticmethod
+  def _match_path( path, include, exclude ):
+    inc = any( r.match( path ) for r in include ) if include else True
+    if not inc:
+      return False
+    return not any( r.match( path ) for r in exclude ) if exclude else True
+
   def process_component( self, top ):
+
+    # Load text-trace configuration from metadata. All text tracing is
+    # disabled by default to avoid overhead and noise.
+    cfg_text_trace = top.get_metadata( self.text_trace ) \
+                     if top.has_metadata( self.text_trace ) else False
+    cfg_include = top.get_metadata( self.text_trace_include ) \
+                  if top.has_metadata( self.text_trace_include ) else [ "*" ]
+    cfg_exclude = top.get_metadata( self.text_trace_exclude ) \
+                  if top.has_metadata( self.text_trace_exclude ) else []
+    cfg_output = top.get_metadata( self.text_trace_output ) \
+                 if top.has_metadata( self.text_trace_output ) else sys.stderr.write
+    cfg_max_len = top.get_metadata( self.text_trace_max_len ) \
+                  if top.has_metadata( self.text_trace_max_len ) else 120
+    cfg_trace_rdy = top.get_metadata( self.text_trace_rdy ) \
+                    if top.has_metadata( self.text_trace_rdy ) else False
+
+    include_res = self._compile_globs( cfg_include )
+    exclude_res = self._compile_globs( cfg_exclude )
+
+    def _write( msg ):
+      if hasattr( cfg_output, "write" ):
+        cfg_output.write( msg )
+      else:
+        cfg_output( msg )
+
+    def _fmt_value( v ):
+      s = str( v )
+      if len( s ) > cfg_max_len:
+        s = s[:cfg_max_len] + "..."
+      return s
+
+    def _emit_text_trace( ifc, kind, args, kwargs, ret ):
+      path = ifc._dsl.full_name
+      if not self._match_path( path, include_res, exclude_res ):
+        return
+
+      try:
+        cycle = top._sim.simulated_cycles
+      except AttributeError:
+        cycle = -1
+
+      arg_strs = [ _fmt_value( a ) for a in args ] + \
+                 [ f"{k}={_fmt_value(v)}" for k, v in kwargs.items() ]
+      args_str = "" if not arg_strs else f"({','.join(arg_strs)})"
+      ret_str = "" if ret is None else f" -> {_fmt_value(ret)}"
+
+      _write( f"cyc={cycle:4d} {kind:4s} {path}{args_str}{ret_str}\n" )
 
     # [wrap_callee_method] wraps the original method in a callee port
     # into a new method that not only calls the origianl method, but
@@ -55,6 +161,19 @@ class CLLineTracePass( BasePass ):
           m.saved_args = args
           m.saved_kwargs = kwargs
           m.saved_ret = ret
+
+        # Emit text trace event if enabled. The parent of a method port
+        # inside a CL interface is the interface itself.
+        if cfg_text_trace:
+          parent = getattr( self._dsl, "parent_obj", None )
+          if isinstance( parent, ( NonBlockingIfc, BlockingIfc ) ):
+            is_method = ( parent.method is self )
+            is_rdy    = getattr( parent, "rdy", None ) is self
+            if is_method:
+              _emit_text_trace( parent, "CALL", args, kwargs, ret )
+            elif cfg_trace_rdy and is_rdy:
+              _emit_text_trace( parent, "RDY", args, kwargs, ret )
+
         return ret
       mport.method = lambda *args, **kwargs : wrapped_method( mport, *args, **kwargs )
 
