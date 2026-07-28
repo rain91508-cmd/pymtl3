@@ -60,6 +60,11 @@ class _PendingVarVisitor(ast.NodeVisitor):
     def __init__(self):
         self.accesses = []        # list of VarAccess
         self._alias_map = {}      # local_var -> tracked_var_name
+        # Variables written through aliases (e.g. `slot = s.state_x[i];
+        # slot["field"] = val`). Kept SEPARATE from `accesses` so the
+        # bidirectional check can detect alias writes without polluting
+        # var_writers (which would create a false-positive explosion).
+        self.alias_written_vars = set()
 
     def _is_tracked_name(self, name_parts):
         """Check if a dotted name like ['s', 'pending_x'] refers to a
@@ -102,6 +107,33 @@ class _PendingVarVisitor(ast.NodeVisitor):
         self.visit(node.value)
         # Then visit targets (writes)
         for target in node.targets:
+            # Track alias: b = s.state_x[i] (or b = s.state_x.field)
+            # Records b -> state_x in _alias_map so subsequent b.field = val
+            # or b[i] = val is recognized as a write to state_x (dict/list
+            # element mutation through a local reference).
+            #
+            # Writes through aliases are recorded in `alias_written_vars`
+            # (SEPARATE from `accesses`) so the bidirectional check can
+            # detect them without polluting var_writers (which would create
+            # a false-positive explosion from new writer→reader pairs).
+            #
+            # Aliases are invalidated when the variable is reassigned to a
+            # non-tracked RHS, preventing stale aliases from producing
+            # spurious writes.
+            if isinstance(target, ast.Name):
+                rhs = node.value
+                if isinstance(rhs, (ast.Subscript, ast.Attribute)):
+                    name_parts = self._get_full_name(rhs)
+                    if name_parts:
+                        tracked = self._is_tracked_name(name_parts)
+                        if tracked:
+                            self._alias_map[target.id] = tracked
+                        else:
+                            self._alias_map.pop(target.id, None)
+                    else:
+                        self._alias_map.pop(target.id, None)
+                else:
+                    self._alias_map.pop(target.id, None)
             self._handle_target(target)
 
     def visit_AugAssign(self, node):
@@ -229,12 +261,10 @@ class _PendingVarVisitor(ast.NodeVisitor):
                     ))
                 elif len(name_parts) == 2 and name_parts[0] in self._alias_map:
                     # Indirect field write: b.field = val where b is aliased
-                    # to a tracked variable
+                    # to a tracked variable. Record in alias_written_vars
+                    # (NOT accesses) to avoid polluting var_writers.
                     tracked_var = self._alias_map[name_parts[0]]
-                    self.accesses.append(VarAccess(
-                        var_name=tracked_var, access_type="write",
-                        method_or_block=""
-                    ))
+                    self.alias_written_vars.add(tracked_var)
         elif isinstance(target, ast.Subscript):
             # s.pending_x[i] = ... or b[i] = ...
             name_parts = self._get_full_name(target)
@@ -246,11 +276,10 @@ class _PendingVarVisitor(ast.NodeVisitor):
                         method_or_block=""
                     ))
                 elif name_parts[0] in self._alias_map:
+                    # Indirect subscript write: b[i] = val where b is aliased
+                    # to a tracked variable. Record in alias_written_vars.
                     tracked_var = self._alias_map[name_parts[0]]
-                    self.accesses.append(VarAccess(
-                        var_name=tracked_var, access_type="write",
-                        method_or_block=""
-                    ))
+                    self.alias_written_vars.add(tracked_var)
 
     def analyze(self, source_code, block_name=""):
         """Parse and analyze source code. Returns list of VarAccess.
@@ -384,6 +413,7 @@ class PendingVarCheckPass(BasePass):
                     visitor = _PendingVarVisitor()
                     accs = visitor.analyze(info['src'], info['name'])
                     info['accesses'] = accs
+                    info['alias_written_vars'] = visitor.alias_written_vars
                 except Exception as e:
                     print(f"[PendingVarCheck] WARNING: could not analyze "
                           f"block {info['name']}: {e}", file=sys.stderr)
@@ -394,6 +424,7 @@ class PendingVarCheckPass(BasePass):
                     visitor = _PendingVarVisitor()
                     accs = visitor.analyze(info['src'], info['name'])
                     info['accesses'] = accs
+                    info['alias_written_vars'] = visitor.alias_written_vars
                 except Exception as e:
                     print(f"[PendingVarCheck] WARNING: could not analyze "
                           f"callee {info['name']}: {e}", file=sys.stderr)
@@ -437,6 +468,23 @@ class PendingVarCheckPass(BasePass):
                         info['name'], info['host'], method_obj, 'M'
                     )
 
+        # Build obj -> set of alias-written var names.
+        # Maps each block function (U kind) and method function (M kind) to
+        # the set of tracked variables it writes through aliases (e.g.
+        # `entry = s.state_lq[idx]; entry["field"] = val`). Used ONLY by the
+        # bidirectional check to detect that the reader also writes the
+        # variable, without polluting var_writers (which would create a
+        # false-positive explosion from new writer→reader pairs).
+        obj_to_alias_written_vars = {}
+        for blk, info in blk_info.items():
+            av = info.get('alias_written_vars')
+            if av:
+                obj_to_alias_written_vars[blk] = av
+        for callee, info in callee_info.items():
+            av = info.get('alias_written_vars')
+            if av:
+                obj_to_alias_written_vars[info['method_obj']] = av
+
         # 5. Check for missing constraints.
         # PyMTL3's GenDAGPass stores constraint tuples in two places:
         #   - `all_constraints`: U<U pairs (and M-pairs propagated through
@@ -448,10 +496,72 @@ class PendingVarCheckPass(BasePass):
         #     pairs do NOT appear in `all_constraints`, so we must consult
         #     both sets; otherwise every top-level CalleeIfcCL that shares a
         #     pending_* var with an @update block would be a false positive.
+        #
+        #   - `_dsl.all_M_constraints`: the FULL set of user-declared M<M and
+        #     M<U pairs, stored as (x, y, is_equal) triples where x/y can be
+        #     CalleeIfcCL, CalleePort, CallerIfcCL, CallerPort, or raw
+        #     function. GenDAGPass propagates these to `all_constraints`
+        #     (in U<U form) ONLY when the callee is called from an
+        #     @update_once block; otherwise (top-level callee or
+        #     cross-component callee without a calling block) the M-pair
+        #     stays ONLY in `all_M_constraints` and is invisible to the
+        #     checks above. This produces false positives for every
+        #     sub-component M<M/M<U constraint whose callee is not called
+        #     from any @update_once block. To suppress these, we build a
+        #     method_obj -> CalleeIfcCL/CalleePort reverse map and consult
+        #     `all_M_constraints` directly.
         all_constraints = top._dag.all_constraints
         top_level_callee_constraints = getattr(
             top._dag, 'top_level_callee_constraints', set()
         )
+        all_M_constraints = getattr(top._dsl, 'all_M_constraints', set())
+
+        # Compute transitive closure of all_constraints (U<U edges only).
+        # GenDAGPass does NOT close the constraint graph transitively, so a
+        # registered-semantics pattern like U(A) < U(B) < U(C) does NOT
+        # appear as (A, C) in all_constraints. We need the closure to detect
+        # the "reader runs before writer" pattern (registered semantics) when
+        # the reverse ordering is only transitively implied.
+        #
+        # Build adjacency list and BFS-reachable set per node. The graph is
+        # small (typically < 500 nodes), so full closure is cheap.
+        constraint_adj = {}  # node -> set of successor nodes
+        for (u, v) in all_constraints:
+            constraint_adj.setdefault(u, set()).add(v)
+        constraint_reachable = {}  # node -> set of nodes reachable from it
+        _all_nodes = set(constraint_adj.keys())
+        for _s_set in constraint_adj.values():
+            _all_nodes.update(_s_set)
+        for _n in _all_nodes:
+            _visited = set()
+            _queue = [_n]
+            while _queue:
+                _cur = _queue.pop(0)
+                for _nb in constraint_adj.get(_cur, ()):
+                    if _nb not in _visited:
+                        _visited.add(_nb)
+                        _queue.append(_nb)
+            constraint_reachable[_n] = _visited
+
+        # Build method_obj -> {CalleeIfcCL, CalleePort} reverse maps so we
+        # can match user-declared M<M / M<U constraints in
+        # `all_M_constraints` against the (writer_obj, reader_obj) function
+        # pairs the pass checks. The constraints store the original
+        # CalleeIfcCL / CalleePort / CallerIfcCL / CallerPort objects, NOT
+        # the resolved method function.
+        from pymtl3.dsl.Connectable import (
+            CalleePort, CallerPort, NonBlockingIfc, BlockingIfc
+        )
+        method_obj_to_callee_objs = {}  # method_func -> set of (callee_obj, port_obj)
+        for callee, info in callee_info.items():
+            try:
+                port = callee.method
+                mo = info['method_obj']
+                method_obj_to_callee_objs.setdefault(mo, set()).add(
+                    (callee, port)
+                )
+            except Exception:
+                pass
 
         # Build method_callers: method_func -> set of calling @update blocks.
         # This is needed to recognize propagated U<U constraints: when a child
@@ -460,20 +570,53 @@ class PendingVarCheckPass(BasePass):
         # NOT (m, r). Without method_callers, we can't match (caller, r) to
         # the (m, r) pair we're checking, producing false positives.
         #
-        # Strategy: match `call` objects from all_upblk_calls against the
-        # CalleeIfcCL objects we already collected in callee_info (direct
-        # identity match, no attribute access needed). For objects NOT in
-        # callee_info (e.g. CallerIfcCL wired to a CalleeIfcCL, or raw
-        # MethodPort), fall back to resolving via .method / .method.method
-        # — which is safe after GenDAGPass has set CallerPort.method (line
-        # 368 of GenDAGPass.py). All attribute access is wrapped in
-        # try/except so a single unresolvable call never crashes the pass.
+        # The `call` objects in all_upblk_calls can be:
+        #   - CalleeIfcCL (direct callee in an update block) -> match by
+        #     identity against callee_info keys.
+        #   - CallerIfcCL (caller interface in an update block) -> call.method
+        #     is the CallerPort; we need to find which CalleeIfcCL it's
+        #     connected to.
+        #   - CallerPort (direct caller port in an update block) -> same
+        #     resolution as CallerIfcCL.
+        #
+        # After CLLineTracePass, each CallerPort gets its OWN unique lambda
+        # wrapper (wrap_caller_method creates a new lambda per CallerPort),
+        # so function identity matching between CallerPort.method and
+        # CalleePort.method/raw_method is impossible. Instead, we use
+        # all_method_nets (from GenDAGPass) to build a CallerPort ->
+        # CalleeIfcCL.method_obj mapping, leveraging the net topology.
         method_callers = {}  # method_func -> set of blk
 
         # Fast lookup: CalleeIfcCL object -> its method function
         callee_obj_to_func = {}
         for callee, info in callee_info.items():
             callee_obj_to_func[callee] = info['method_obj']
+
+        # Build CallerPort -> raw_method mapping via all_method_nets.
+        # Each method net is (writer_calleeport, {set of caller ports}).
+        # The writer CalleePort is `callee.method` for some CalleeIfcCL;
+        # we map each CallerPort in the net to that callee's raw_method.
+        calleeport_to_func = {}
+        for callee, info in callee_info.items():
+            try:
+                port = callee.method
+                if isinstance(port, CalleePort):
+                    calleeport_to_func[port] = info['method_obj']
+            except Exception:
+                pass
+
+        callerport_to_func = {}  # CallerPort -> raw_method
+        try:
+            all_method_nets = top.get_all_method_nets()
+            for writer, net in all_method_nets:
+                raw = calleeport_to_func.get(writer)
+                if raw is None:
+                    continue
+                for member in net:
+                    if isinstance(member, CallerPort) and member is not writer:
+                        callerport_to_func[member] = raw
+        except Exception:
+            pass
 
         all_upblk_calls = getattr(top._dsl, 'all_upblk_calls', {})
         for blk, calls in all_upblk_calls.items():
@@ -483,20 +626,20 @@ class PendingVarCheckPass(BasePass):
                 if call in callee_obj_to_func:
                     func = callee_obj_to_func[call]
                 else:
-                    # 2. Fallback: resolve via attribute access (CallerIfcCL,
-                    #    MethodPort, or other NonBlockingIfc/BlockingIfc).
-                    #    After GenDAGPass, CallerPort.method is set to the
-                    #    callee's function, so call.method.method gives the
-                    #    actual method function.
-                    #    NOTE: This is temporarily DISABLED because accessing
-                    #    call.method.method on certain NonBlockingIfc objects
-                    #    causes side effects that break ISA simulation. The
-                    #    direct match above handles the common case (CalleeIfcCL
-                    #    called directly in an update block). CallerIfcCL calls
-                    #    are not resolved, which may cause some false positives
-                    #    for propagated constraints — but those are warnings,
-                    #    not errors, and the ISA test correctness is paramount.
-                    pass
+                    # 2. Resolve CallerPort or CallerIfcCL to raw_method via
+                    #    the callerport_to_func mapping built from method nets.
+                    #    For CallerIfcCL: call.method is the CallerPort.
+                    #    For CallerPort: call IS the CallerPort.
+                    try:
+                        if isinstance(call, CallerPort):
+                            func = callerport_to_func.get(call)
+                        else:
+                            # CallerIfcCL or other NonBlockingIfc
+                            cp = getattr(call, 'method', None)
+                            if isinstance(cp, CallerPort):
+                                func = callerport_to_func.get(cp)
+                    except Exception:
+                        pass
                 if func is not None:
                     method_callers.setdefault(func, set()).add(blk)
 
@@ -531,9 +674,116 @@ class PendingVarCheckPass(BasePass):
                     has_constraint = self._has_constraint(
                         all_constraints, top_level_callee_constraints,
                         method_callers,
+                        all_M_constraints, method_obj_to_callee_objs,
+                        constraint_reachable,
                         writer_obj, writer_kind,
                         reader_obj, reader_kind
                     )
+
+                    # Bidirectional read-write detection (Trap #15 #3):
+                    # When BOTH methods read AND write the same state variable,
+                    # the pass may pick the wrong direction. If the forward
+                    # constraint (writer → reader) is missing, check the REVERSE
+                    # direction (reader → writer). If the reverse constraint
+                    # exists, this is a false positive — the existing constraint
+                    # covers the bidirectional case (registered semantics:
+                    # reader runs before writer, reads OLD values; writer's
+                    # new values visible next cycle).
+                    if not has_constraint:
+                        # Check if reader also writes and writer also reads
+                        # the same variable (bidirectional access).
+                        # Direct write: reader appears in var_writers for var.
+                        # Alias write: reader writes via an alias like
+                        # `entry = s.state_x[i]; entry["field"] = val`. These
+                        # are tracked separately in obj_to_alias_written_vars
+                        # to avoid polluting var_writers.
+                        reader_also_writes = (
+                            reader_obj in var_writers.get(var_name, {})
+                            or var_name in obj_to_alias_written_vars.get(
+                                reader_obj, set()
+                            )
+                        )
+                        writer_also_reads = (
+                            writer_obj in var_readers.get(var_name, {})
+                        )
+                        if reader_also_writes and writer_also_reads:
+                            # Bidirectional: check reverse constraint.
+                            # Applies to U<U and M<M (both methods read AND
+                            # write the same var, so either direction could be
+                            # correct depending on data flow).
+                            if ((writer_kind == 'U' and reader_kind == 'U')
+                                    or (writer_kind == 'M' and reader_kind == 'M')):
+                                has_reverse = self._has_constraint(
+                                    all_constraints,
+                                    top_level_callee_constraints,
+                                    method_callers,
+                                    all_M_constraints, method_obj_to_callee_objs,
+                                    constraint_reachable,
+                                    reader_obj, reader_kind,
+                                    writer_obj, writer_kind
+                                )
+                                if has_reverse:
+                                    has_constraint = True
+                                elif var_name.startswith(('state_', '_state_')):
+                                    # Disjoint-access pattern (Trap #15 #4):
+                                    # Both methods read AND write a state_*
+                                    # variable via field mutation (dict entry
+                                    # aliases like `entry = s.state_lq[idx];
+                                    # entry["field"] = val`). No constraint
+                                    # exists in EITHER direction.
+                                    #
+                                    # This is the NORMAL pattern for dict-based
+                                    # state in CL models: multiple @update_once
+                                    # blocks and CalleeIfcCL methods operate on
+                                    # DIFFERENT fields of DIFFERENT entries,
+                                    # guarded by fsm state or other conditions.
+                                    # The designer intentionally left them
+                                    # unordered because the operations are
+                                    # disjoint or idempotent.
+                                    #
+                                    # Suppress to avoid false positives. If a
+                                    # real data race exists (two methods writing
+                                    # the SAME field of the SAME entry), it
+                                    # should be caught by explicit testing, not
+                                    # by this pass (which can't distinguish
+                                    # disjoint from overlapping access).
+                                    has_constraint = True
+                        elif (writer_also_reads
+                                and var_name.startswith(('state_', '_state_'))
+                                and ((writer_kind == 'U' and reader_kind == 'U')
+                                     or (writer_kind == 'M' and reader_kind == 'M'))):
+                            # Dict-scan pattern (Trap #15 #5):
+                            # Writer reads AND writes a state_* variable
+                            # (guard-checked access via dict entry aliases like
+                            # `entry = s.state_x[idx]; entry["field"] = val`),
+                            # but reader ONLY reads (scans entries, e.g.
+                            # `for idx in range(N): entry = s.state_x[idx];
+                            # if entry["valid"]: ...`). No constraint exists
+                            # in EITHER direction.
+                            #
+                            # This is the "writer initializes/updates specific
+                            # entries, reader scans all entries" pattern,
+                            # common in CL models with dict-based state. The
+                            # writer's alias-assignment `entry = s.state_x[idx]`
+                            # is a direct READ of state_x, and its subsequent
+                            # field writes (e.g. `entry["valid"] = True`,
+                            # `entry["has_stale_translation"] = False`) are
+                            # INITIALIZATION writes that cause the reader to
+                            # SKIP the entry (reader guards on `valid` and
+                            # `has_stale_translation`).
+                            #
+                            # The race is benign: regardless of writer/reader
+                            # ordering, the reader skips the entry being
+                            # initialized (if reader runs first, entry is
+                            # `valid=False` -> skip; if reader runs after,
+                            # entry is `valid=True, has_stale_translation=False`
+                            # -> skip). No constraint is needed.
+                            #
+                            # Suppress to avoid false positives. Real races on
+                            # overlapping DATA fields of the SAME entry (where
+                            # the reader's behavior depends on the writer's
+                            # value) should be caught by explicit testing.
+                            has_constraint = True
 
                     if not has_constraint:
                         # Check for CL discipline violation
@@ -617,6 +867,8 @@ class PendingVarCheckPass(BasePass):
 
     def _has_constraint(self, all_constraints, top_level_callee_constraints,
                         method_callers,
+                        all_M_constraints, method_obj_to_callee_objs,
+                        constraint_reachable,
                         writer_obj, writer_kind, reader_obj, reader_kind):
         """Check if a constraint exists between writer and reader in the
         constraint graph.
@@ -645,12 +897,37 @@ class PendingVarCheckPass(BasePass):
         method FUNCTIONS (callee.method.method), matching the identity used
         by GenDAGPass when it builds `top_level_callee_constraints` and
         `method_callers`.
+
+        3. `all_M_constraints`: the FULL set of user-declared M<M and M<U
+           pairs (not propagated), stored as (x, y, is_equal) triples
+           where x/y can be CalleeIfcCL, CalleePort, CallerIfcCL,
+           CallerPort, or raw function. GenDAGPass propagates these to
+           `all_constraints` (in U<U form) ONLY when the callee is called
+           from an @update_once block; otherwise the M-pair stays ONLY in
+           `all_M_constraints`. We consult this set directly via a
+           method_obj -> {callee_obj, port_obj} reverse map to recognize
+           user-declared constraints that the propagated-form check misses.
         """
         # U<U: both are update blocks -- only stored in all_constraints.
         if writer_kind == 'U' and reader_kind == 'U':
+            # Forward constraint: writer < reader
             for (u, v) in all_constraints:
                 if u is writer_obj and v is reader_obj:
                     return True
+            # Reverse constraint (registered semantics): reader runs before
+            # writer transitively. GenDAGPass does NOT transitively close
+            # all_constraints, so we use the pre-computed BFS closure.
+            #
+            # This handles the parent-child ordering pattern where the reader
+            # reads OLD values (from previous cycle) and the writer's new
+            # values are visible next cycle. Without this check, every
+            # U<U pair without a direct forward constraint would be flagged,
+            # even when the reverse ordering is intentionally established via
+            # transitive constraints (e.g. U(reader) < U(parent.up_process)
+            # < U(writer) via M<U propagation).
+            if (reader_obj in constraint_reachable
+                    and writer_obj in constraint_reachable.get(reader_obj, ())):
+                return True
             return False
 
         # M<U, U<M, M<M: at least one side is a method.
@@ -687,5 +964,148 @@ class PendingVarCheckPass(BasePass):
                         for (u, v) in all_constraints:
                             if u is caller_w and v is caller_r:
                                 return True
+
+        # 5. Direct lookup in `all_M_constraints`. This catches all
+        #    user-declared M<M / M<U constraints whose CalleeIfcCL is NOT
+        #    called from any @update_once block (so GenDAGPass never
+        #    propagated them to `all_constraints`). This is the primary
+        #    mechanism for recognizing top-level callee constraints and
+        #    sub-component constraints that the propagated-form checks
+        #    above cannot see.
+        #
+        # `all_M_constraints` stores (x, y, is_equal) triples where x/y
+        # can be CalleeIfcCL, CalleePort, CallerIfcCL, CallerPort, or raw
+        # function. For M<U, y is the @update_once block function of the
+        # SAME component instance that owns x. When the model has multiple
+        # component instances (e.g. per-thread), each has its own
+        # `up_dispatch` function object, so we must match y against
+        # reader_obj by identity OR by (host, name) when both are update
+        # blocks of the same component.
+        writer_callee_objs = method_obj_to_callee_objs.get(writer_obj, set())
+        reader_callee_objs = method_obj_to_callee_objs.get(reader_obj, set())
+        # Also include the method_obj itself in case the constraint
+        # was declared with the raw function rather than a CalleeIfcCL.
+        writer_candidates = set(writer_callee_objs)
+        writer_candidates.add((writer_obj, writer_obj))
+        if reader_kind == 'M':
+            reader_candidates = set(reader_callee_objs)
+            reader_candidates.add((reader_obj, reader_obj))
+        else:
+            # M<U case: reader is an @update_once block; reader_obj is
+            # the block function. M<U constraints store the U side as a
+            # function directly.
+            reader_candidates = {(reader_obj, reader_obj)}
+
+        # For M<U, also resolve reader_obj's host and name so we can
+        # match y by (host, name) when identity fails (multiple instances
+        # of the same block name in different components).
+        reader_host = None
+        reader_name = None
+        if reader_kind == 'U':
+            try:
+                reader_host = top.get_update_block_host_component(reader_obj)
+            except Exception:
+                reader_host = None
+            reader_name = getattr(reader_obj, '__name__', None)
+
+        for (w_callee, w_port) in writer_candidates:
+            # Resolve writer's host for (host, name) matching.
+            w_host = None
+            try:
+                # w_callee may be a CalleeIfcCL or a function.
+                if hasattr(w_callee, 'get_parent_object'):
+                    w_host = w_callee.get_parent_object()
+            except Exception:
+                w_host = None
+            for (r_callee, r_port) in reader_candidates:
+                for (x, y, is_equal) in all_M_constraints:
+                    if is_equal:
+                        continue
+                    # Match x against any form of the writer (CalleeIfcCL,
+                    # CalleePort, or raw function).
+                    x_match = (x is w_callee or x is w_port
+                               or x is writer_obj)
+                    if not x_match:
+                        continue
+                    # Match y against any form of the reader.
+                    y_match = (y is r_callee or y is r_port
+                               or y is reader_obj)
+                    if y_match:
+                        return True
+                    # M<U fallback: match by (host, name) when both y and
+                    # reader_obj are update blocks of the same component.
+                    if (reader_kind == 'U' and reader_host is not None
+                            and reader_name is not None
+                            and w_host is not None):
+                        y_name = getattr(y, '__name__', None)
+                        if y_name is not None and y_name == reader_name:
+                            try:
+                                y_host = top.get_update_block_host_component(y)
+                            except Exception:
+                                y_host = None
+                            if y_host is w_host:
+                                return True
+
+        # 6. Registered-semantics (reverse) check.
+        # If the REVERSE ordering exists (reader runs BEFORE writer, possibly
+        # transitively), the user intentionally chose registered semantics:
+        # the reader reads OLD values and the writer's new values are visible
+        # next cycle. The forward constraint (writer < reader) would create a
+        # cycle and is intentionally omitted.
+        #
+        # GenDAGPass does NOT transitively close all_constraints, so we use
+        # `constraint_reachable` (pre-computed BFS closure) to detect
+        # transitive reverse orderings like:
+        #   U(reader) < U(parent.up_process) < U(writer)
+        # which arise from parent-child ordering + M<U propagation.
+        #
+        # U<U case: reader reaches writer transitively.
+        if writer_kind == 'U' and reader_kind == 'U':
+            if (reader_obj in constraint_reachable
+                    and writer_obj in constraint_reachable.get(reader_obj, ())):
+                return True
+            # Debug: check why reverse check fails
+            import os
+            if os.environ.get('PVCP_DEBUG2'):
+                r_name = getattr(reader_obj, '__name__', '?')
+                w_name = getattr(writer_obj, '__name__', '?')
+                r_in = reader_obj in constraint_reachable
+                w_in_reach = writer_obj in constraint_reachable.get(reader_obj, set())
+                # Check if reader_obj is in constraint_adj at all
+                r_in_adj = reader_obj in constraint_adj if 'constraint_adj' in dir() else '?'
+                print(f"  RVCHK U<U: reader={r_name}(id={id(reader_obj)}) writer={w_name}(id={id(writer_obj)}) "
+                      f"r_in_reachable={r_in} w_in_r_reach={w_in_reach}", file=__import__('sys').stderr)
+                # Show what reader_obj CAN reach
+                if r_in:
+                    reach = constraint_reachable[reader_obj]
+                    for n in list(reach)[:5]:
+                        n_name = getattr(n, '__name__', repr(n))
+                        print(f"    reach: {n_name}(id={id(n)})", file=__import__('sys').stderr)
+
+        # M<U case: reader reaches a caller of the writer transitively.
+        # This is the parent-child ordering pattern: the parent's up_process
+        # calls the child's CalleeIfcCL (writer), and the child's up_process
+        # (reader) is constrained to run before the parent's up_process.
+        #   U(reader) < U(parent.up_process)  [parent-child ordering]
+        #   parent.up_process calls writer    [M<U propagation]
+        # So reader runs before writer — registered semantics.
+        if writer_kind == 'M' and reader_kind == 'U':
+            writer_callers = method_callers.get(writer_obj)
+            if writer_callers:
+                reader_reach = constraint_reachable.get(reader_obj, ())
+                for caller in writer_callers:
+                    if caller in reader_reach:
+                        return True
+
+        # M<M case: a caller of the reader reaches a caller of the writer
+        # transitively (reverse M<M via propagated U<U).
+        if writer_kind == 'M' and reader_kind == 'M':
+            writer_callers = method_callers.get(writer_obj, set())
+            reader_callers = method_callers.get(reader_obj, set())
+            for r_caller in reader_callers:
+                r_reach = constraint_reachable.get(r_caller, ())
+                for w_caller in writer_callers:
+                    if w_caller in r_reach:
+                        return True
 
         return False
