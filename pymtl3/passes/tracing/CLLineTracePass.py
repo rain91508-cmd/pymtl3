@@ -123,7 +123,9 @@ class CLLineTracePass( BasePass ):
 
     def _fmt_value( v ):
       s = str( v )
-      if len( s ) > cfg_max_len:
+      # A max_len of None or 0 disables truncation so full arguments are
+      # available for debug (e.g. large BackwardCtrlBus / IQDispatchReq).
+      if cfg_max_len and len( s ) > cfg_max_len:
         s = s[:cfg_max_len] + "..."
       return s
 
