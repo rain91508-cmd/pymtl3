@@ -56,15 +56,68 @@ class SimpleSchedulePass( BasePass ):
 
     Q = [ v for v in V if not InD[v] ]
 
-    import random
-    while Q:
-      random.shuffle(Q)
-      u = Q.pop()
-      update_schedule.append( u )
-      for v in Es[u]:
-        InD[v] -= 1
-        if not InD[v]:
-          Q.append( v )
+    # Deterministic scheduling (opt-in via PYMTL3_DETERMINISTIC_SCHED=1):
+    # sort Q by (host_component_repr, block_name, src_loc) instead of
+    # random.shuffle. This makes the update block schedule reproducible
+    # regardless of random seed or PYTHONHASHSEED, eliminating run-to-run
+    # nondeterminism in CL simulations. By default, random.shuffle is used
+    # to stress-test missing M<U constraints.
+    import os as _os
+    _deterministic_sched = _os.environ.get( "PYMTL3_DETERMINISTIC_SCHED", "" )
+
+    if _deterministic_sched:
+      from pymtl3.dsl import CalleePort
+
+      def _src_loc( v ):
+        func = None
+        if isinstance( v, CalleePort ):
+          func = getattr( v, "method", None )
+        else:
+          func = v
+        if func is not None and hasattr( func, "__code__" ):
+          co = func.__code__
+          return ( co.co_filename, co.co_firstlineno )
+        return ( "", 0 )
+
+      def _func_name( v ):
+        if isinstance( v, CalleePort ):
+          return repr( v )
+        nm = getattr( v, "__name__", None )
+        if nm is not None:
+          return nm
+        return f"<unknown:{type(v).__name__}>"
+
+      def _host_repr( v ):
+        try:
+          if isinstance( v, CalleePort ):
+            host = v.get_parent_object()
+          else:
+            host = top.get_update_block_host_component( v )
+          return repr( host )
+        except Exception:
+          return ""
+
+      def _sched_sort_key( v ):
+        return ( _host_repr( v ), _func_name( v ), _src_loc( v ) )
+
+      while Q:
+        Q.sort( key=_sched_sort_key )
+        u = Q.pop( 0 )
+        update_schedule.append( u )
+        for v in Es[u]:
+          InD[v] -= 1
+          if not InD[v]:
+            Q.append( v )
+    else:
+      import random
+      while Q:
+        random.shuffle( Q )
+        u = Q.pop()
+        update_schedule.append( u )
+        for v in Es[u]:
+          InD[v] -= 1
+          if not InD[v]:
+            Q.append( v )
 
     check_schedule( top, update_schedule, V, E, InD )
 
