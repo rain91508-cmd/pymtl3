@@ -93,8 +93,14 @@ class DynamicSchedulePass( BasePass ):
 
     import os
     _deterministic = os.environ.get( "PYMTL3_DETERMINISTIC_SCHED", "" )
+    _perm_seed = os.environ.get( "PYMTL3_SCHED_PERM_SEED", "" )
 
-    if _deterministic:
+    # A permutation seed only makes sense on top of a reproducible base order,
+    # so setting it implicitly forces the deterministic branch. It then drives
+    # seeded tie-breaking in the topological sort so every seed yields a
+    # *different but reproducible* valid schedule order. This lets a
+    # schedule-dependent bug be reproduced and bisected across seeds.
+    if _deterministic or _perm_seed:
       # Deterministic scheduling: use a stable sort key to make the schedule
       # reproducible across runs. Set iteration order depends on id()/hash of
       # function objects, which varies across processes. Sorting by a stable
@@ -102,6 +108,17 @@ class DynamicSchedulePass( BasePass ):
       # nondeterminism.  Opt-in via PYMTL3_DETERMINISTIC_SCHED=1.
       _sort_key = _make_stable_sort_key( top )
       V_sorted = sorted( V, key=_sort_key )
+
+      if _perm_seed != "":
+        import random as _random
+        _rng = _random.Random( int( _perm_seed ) )
+        _seeded = True
+        _tmp = list( V_sorted )
+        _rng.shuffle( _tmp )
+        V_sorted = _tmp
+      else:
+        _rng = None
+        _seeded = False
 
       G   = { v: [] for v in V_sorted }
       G_T = { v: [] for v in V_sorted } # transpose graph
@@ -131,20 +148,25 @@ class DynamicSchedulePass( BasePass ):
       scc_pred = {}
       scc_schedule = []
 
-      import heapq
-      Q = []
-      for i in range(len(SCCs)):
-        if not InD[i]:
-          heapq.heappush( Q, ( scc_sort_keys[i], i ) )
-          scc_pred[ i ] = None
+      # Seeded tie-break: pick a random ready SCC instead of the min-key one,
+      # so the top-level order varies per seed while staying topologically
+      # valid.  Non-seeded keeps the original min-key (stable) behaviour.
+      ready = [ i for i in range(len(SCCs)) if not InD[i] ]
+      for i in ready:
+        scc_pred[ i ] = None
 
-      while Q:
-        _, u = heapq.heappop( Q )
+      while ready:
+        if _seeded:
+          j = _rng.randrange( len( ready ) )
+          u = ready.pop( j )
+        else:
+          u = min( ready, key=lambda i: scc_sort_keys[i] )
+          ready.remove( u )
         scc_schedule.append( u )
         for v in sorted( G_new[u], key=lambda x: scc_sort_keys[x] ):
           InD[v] -= 1
           if not InD[v]:
-            heapq.heappush( Q, ( scc_sort_keys[v], v ) )
+            ready.append( v )
             scc_pred[ v ] = u
 
       assert len(scc_schedule) == len(SCCs)
@@ -176,7 +198,13 @@ class DynamicSchedulePass( BasePass ):
             for (u, v) in E:
               if u in scc and v in scc:
                 InD[ v ] += 1
-            Q.append( max(InD, key=lambda v: (InD[v], _sort_key(v))) )
+            _max_in = max( InD.values() )
+            _cands = [ v for v in scc if InD[v] == _max_in ]
+            if _seeded and len(_cands) > 1:
+              root = _cands[ _rng.randrange( len(_cands) ) ]
+            else:
+              root = max( _cands, key=lambda v: (InD[v], _sort_key(v)) )
+            Q.append( root )
           else:
             pred = set( SCCs[ scc_pred[i] ] )
             for x in sorted( scc, key=_sort_key ):
@@ -186,7 +214,11 @@ class DynamicSchedulePass( BasePass ):
 
           visited = set(Q)
           while Q:
-            u = Q.popleft()
+            if _seeded and len(Q) > 1:
+              j = _rng.randrange( len(Q) )
+              u = Q[j]; del Q[j]
+            else:
+              u = Q.popleft()
             tmp_schedule.append( u )
             for v in sorted( G[u], key=_sort_key ):
               if v in scc and v not in visited:
@@ -268,7 +300,12 @@ generated_block = wrapped_SCC_{0}
 
           scc_block_src = template.format( scc_id, "; ".join( copy_srcs ), "\n    ".join( check_srcs ),
                                            ", ".join( [ x.__name__ for x in scc] ) )
-          schedule.append( gen_wrapped_SCCblk( top, tmp_schedule, scc_block_src ) )
+          _gen = gen_wrapped_SCCblk( top, tmp_schedule, scc_block_src )
+          # Label the generated SCC block with its member order so schedule
+          # dumps are human-diffable across seeds.
+          _gen.__name__ = "SCC%d__" % scc_id + ",".join(
+              getattr(x, "__name__", repr(x)) for x in tmp_schedule )
+          schedule.append( _gen )
 
     else:
       # Non-deterministic (default): rely on set/dict iteration order.
@@ -429,7 +466,12 @@ generated_block = wrapped_SCC_{0}
 
           scc_block_src = template.format( scc_id, "; ".join( copy_srcs ), "\n    ".join( check_srcs ),
                                            ", ".join( [ x.__name__ for x in scc] ) )
-          schedule.append( gen_wrapped_SCCblk( top, tmp_schedule, scc_block_src ) )
+          _gen = gen_wrapped_SCCblk( top, tmp_schedule, scc_block_src )
+          # Label the generated SCC block with its member order so schedule
+          # dumps are human-diffable across seeds.
+          _gen.__name__ = "SCC%d__" % scc_id + ",".join(
+              getattr(x, "__name__", repr(x)) for x in tmp_schedule )
+          schedule.append( _gen )
 
 def kosaraju_scc( G, G_T, sort_key=None ):
 
